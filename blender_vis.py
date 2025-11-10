@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""
+Blender utility helpers.
+
+This module provides:
+  • Headless Blender smoke tests and sample renders (run via system Python).
+  • Scene utilities callable from inside Blender (e.g. rendering asset bundles).
+"""
+
+import logging
+import argparse
+import os
+import os.path as osp
+import pickle
+import subprocess
+import sys
+from glob import glob
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+COLOR_CHOICES: Dict[str, Tuple[float, float, float]] = {
+    "green": (0.45, 0.75, 0.55),
+    "lightgreen": (0.68, 0.85, 0.60),
+    "purple": (0.67, 0.57, 0.86),
+    "red": (0.93, 0.45, 0.45),
+    "yellow": (0.96, 0.88, 0.55),
+    "blue1": (0.45, 0.63, 0.95),
+    "blue2": (0.60, 0.75, 0.98),
+    "pink": (0.94, 0.66, 0.86),
+}
+
+DEFAULT_HAND_COLORS: Tuple[str, str] = ("blue1", "blue2")
+DEFAULT_OBJECT_COLOR: str = "pink"
+
+_HAND_COLOR_SELECTION: Tuple[str, str] = DEFAULT_HAND_COLORS
+_OBJECT_COLOR_SELECTION: str = DEFAULT_OBJECT_COLOR
+
+
+def _validate_color_name(name: str) -> str:
+    key = name.lower()
+    if key not in COLOR_CHOICES:
+        raise ValueError(
+            f"Unknown color '{name}'. Available options: {', '.join(sorted(COLOR_CHOICES))}"
+        )
+    return key
+
+
+def _parse_hand_colors(option: str) -> Tuple[str, str]:
+    parts = [p.strip() for p in option.split(",") if p.strip()]
+    if not parts:
+        parts = list(DEFAULT_HAND_COLORS)
+    if len(parts) == 1:
+        parts = [parts[0], parts[0]]
+    elif len(parts) > 2:
+        parts = parts[:2]
+    return (_validate_color_name(parts[0]), _validate_color_name(parts[1]))
+
+try:
+    import bpy  # type: ignore
+    from mathutils import Matrix, Vector  # type: ignore
+except ImportError:  # pragma: no cover - bpy only available inside Blender
+    bpy = None  # type: ignore
+    Matrix = None  # type: ignore
+    Vector = None  # type: ignore
+
+LOGGER = logging.getLogger("mayday.blender_vis")
+
+
+def _ensure_logger() -> None:
+    if LOGGER.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+
+
+def _run(
+    cmd: Sequence[str],
+    description: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    print(f"\n[blender-test] {description}\n  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.stderr:
+        print(result.stderr.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({description}) with exit code {result.returncode}"
+        )
+    return result
+
+
+def _list_asset_files(asset_root: str) -> List[str]:
+    asset_root = osp.abspath(asset_root)
+    pkl_files = sorted(
+        path
+        for path in glob(osp.join(asset_root, "*.pkl"))
+        if osp.isfile(path)
+    )
+    if pkl_files:
+        return pkl_files
+
+    dirs = [
+        osp.join(asset_root, entry)
+        for entry in sorted(os.listdir(asset_root))
+        if len(entry) == 4 and entry.isdigit() and osp.isdir(osp.join(asset_root, entry))
+    ]
+    return dirs
+
+
+def _load_asset_bundle(path: str) -> Dict:
+    if osp.isdir(path):
+        candidate = osp.join(path, "assets.pkl")
+        if not osp.isfile(candidate):
+            raise FileNotFoundError(
+                f"No assets.pkl found under directory '{path}'. "
+                "If you migrated to flat .pkl layout, point render_assets_with_blender "
+                "to the new directory."
+            )
+        path = candidate
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _clear_scene():
+    if bpy is None:
+        return
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+
+    for mesh in list(bpy.data.meshes):
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    for mat in list(bpy.data.materials):
+        if mat.users == 0:
+            bpy.data.materials.remove(mat)
+    for cam in list(bpy.data.cameras):
+        if cam.users == 0:
+            bpy.data.cameras.remove(cam)
+
+
+def _ensure_material(name: str, color: Iterable[float], alpha: float = 1.0):
+    if bpy is None:
+        return None
+
+    mat_name = f"{name}_mat"
+    material = bpy.data.materials.get(mat_name)
+    if material is None:
+        material = bpy.data.materials.new(mat_name)
+        material.use_nodes = True
+
+    material.blend_method = "BLEND"
+    nodes = material.node_tree.nodes
+    principled = nodes.get("Principled BSDF")
+    if principled is None:
+        principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.inputs["Base Color"].default_value = (
+        float(color[0]),
+        float(color[1]),
+        float(color[2]),
+        1.0,
+    )
+    principled.inputs["Alpha"].default_value = float(alpha)
+    principled.inputs["Roughness"].default_value = 0.5
+    principled.inputs["Metallic"].default_value = 0.0
+    return material
+
+
+def _mesh_color_palette(name: str, base_color: Iterable[float]) -> Tuple[float, float, float]:
+    name_lower = name.lower()
+    if "left" in name_lower:
+        return COLOR_CHOICES[_HAND_COLOR_SELECTION[0]]
+    if "right" in name_lower:
+        return COLOR_CHOICES[_HAND_COLOR_SELECTION[1]]
+    if "object" in name_lower:
+        return COLOR_CHOICES[_OBJECT_COLOR_SELECTION]
+    return tuple(float(c) for c in base_color[:3])
+
+
+def _material_params(name: str) -> Tuple[float, float]:
+    name_lower = name.lower()
+    if "left" in name_lower or "right" in name_lower:
+        return 0.55, 0.05
+    if "object" in name_lower:
+        return 0.35, 0.0
+    return 0.6, 0.0
+
+
+def _build_mesh(mesh_info: Dict, stylized: bool = True):
+    if bpy is None:
+        raise RuntimeError("Blender (bpy) is required to create meshes.")
+
+    name = mesh_info["name"]
+    verts = mesh_info["vertices"]
+    faces = mesh_info["faces"]
+    color = mesh_info.get("color", [0.8, 0.8, 0.8, 1.0])
+    alpha = mesh_info.get("alpha", color[-1] if len(color) == 4 else 1.0)
+
+    mesh_data = bpy.data.meshes.new(name)
+    mesh_data.from_pydata(
+        [tuple(map(float, v)) for v in verts],
+        [],
+        [tuple(map(int, f)) for f in faces],
+    )
+    mesh_data.update(calc_edges=True)
+    for poly in mesh_data.polygons:
+        poly.use_smooth = True
+
+    mesh_obj = bpy.data.objects.new(name, mesh_data)
+    bpy.context.collection.objects.link(mesh_obj)
+
+    if stylized:
+        palette_color = _mesh_color_palette(name, color)
+        roughness, metallic = _material_params(name)
+        _assign_material(mesh_obj, palette_color, roughness=roughness, metallic=metallic, alpha=alpha)
+    return mesh_obj
+
+
+def _choose_render_engine(scene) -> str:
+    if bpy is None:
+        raise RuntimeError("Blender (bpy) is required to configure render engines.")
+    eng_prop = bpy.types.RenderSettings.bl_rna.properties["engine"]
+    available = [item.identifier for item in eng_prop.enum_items]
+    for preferred in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"):
+        if preferred in available:
+            scene.render.engine = preferred
+            return preferred
+    if not available:
+        raise RuntimeError("No render engines available in this Blender build.")
+    fallback = available[0]
+    scene.render.engine = fallback
+    return fallback
+
+
+def pytorch3d_to_blender_camera(wTc_pytorch3d):
+    """
+    Convert camera-to-world transform from PyTorch3D to Blender convention.
+    
+    PyTorch3D convention:
+    - World: +Y up, +X left, +Z forward (into scene)
+    - Camera looks along +Z
+    
+    Blender convention:
+    - World: +Z up, +X right, +Y forward
+    - Camera looks along -Z (local)
+    
+    Args:
+        wTc_pytorch3d: (4, 4) camera-to-world matrix in PyTorch3D convention
+        
+    Returns:
+        wTc_blender: (4, 4) camera-to-world matrix in Blender convention
+    """
+    camera_rotation = np.array([
+        [ 1,  0,  0,  0],  # Keep X
+        [ 0, -1,  0,  0],  # Flip Y: -Y up -> +Y up
+        [ 0,  0, -1,  0],  # Flip Z: +Z front -> -Z front
+        [ 0,  0,  0,  1]
+    ])
+    
+    # camera_rotation = np.array([
+    #     [-1,  0,  0,  0],  # Flip X: left -> right
+    #     [ 0,  1,  0,  0],  # Keep Y: up -> up
+    #     [ 0,  0, -1,  0],  # Flip Z: forward -> backward
+    #     [ 0,  0,  0,  1]
+    # ])
+    
+    wTc_blender = wTc_pytorch3d @ camera_rotation
+
+    return wTc_blender
+
+
+def _configure_camera_from_assets(camera_assets: Dict) -> Tuple[object, object]:
+    if bpy is None:
+        raise RuntimeError("Blender (bpy) is required to create cameras.")
+
+    width = int(camera_assets["width"])
+    height = int(camera_assets["height"])
+    K = np.asarray(camera_assets["intrinsic"], dtype=np.float32)
+    wTc_pytorch3d = np.asarray(camera_assets["extrinsic_wTc"], dtype=np.float32)
+    # The saved extrinsics come from PyTorch3D where camera axes are:
+    #   +X left, +Y up, +Z forward.
+    # Blender expects camera local axes:
+    #   +X right, +Y up,  camera looks along -Z.
+    # Flip X and Z to convert PyTorch3D camera coordinates into Blender's convention.
+ 
+    # Coordinate conversion matrix
+    # PyTorch3D: +X right, +Y up, +Z forward (away from camera)
+    # Blender:   +X right, +Y forward, +Z up
+    # conv_matrix = np.array([[1,  0,  0, 0],
+    #                         [0,  0,  1, 0],
+    #                         [0, -1,  0, 0],
+    #                         [0,  0,  0, 1]], dtype=np.float32)
+
+    # conv_matrix = np.eye(4)
+    
+    # Apply coordinate conversion: wTc_blender = Conv @ wTc_pytorch3d @ Conv^T
+    # wTc_blender = conv_matrix @ wTc_pytorch3d @ conv_matrix.T
+
+    wTc_blender = pytorch3d_to_blender_camera(wTc_pytorch3d)
+
+    cam_data = bpy.data.cameras.new("PredictedCamera")
+    cam_obj = bpy.data.objects.new("PredictedCamera", cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+
+    sensor_width = 36.0
+    sensor_height = sensor_width * height / max(width, 1)
+    cam_data.sensor_width = sensor_width
+    cam_data.sensor_height = sensor_height
+    cam_data.lens = sensor_width * K[0, 0] / max(width, 1)
+    cam_data.lens_unit = "MILLIMETERS"
+
+    cam_data.shift_x = (K[0, 2] - width / 2) / width
+    cam_data.shift_y = (height / 2 - K[1, 2]) / height
+
+
+    cam_obj.matrix_world = Matrix([tuple(row) for row in wTc_blender])
+
+    scene = bpy.context.scene
+    _choose_render_engine(scene)
+    scene.camera = cam_obj
+    scene.render.resolution_x = width
+    scene.render.resolution_y = height
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = True
+    return cam_obj, cam_data
+
+
+def _look_at(camera_obj, target: Tuple[float, float, float]):
+    if bpy is None or Vector is None:
+        return
+    direction = Vector(target) - camera_obj.location
+    direction.normalize()
+    rotation = direction.to_track_quat("-Z", "Y")
+    camera_obj.rotation_mode = "QUATERNION"
+    camera_obj.rotation_quaternion = rotation
+
+
+def _assign_material(obj, color, roughness=0.45, metallic=0.0, alpha=1.0):
+    material = _ensure_material(obj.name, color, alpha)
+    if material:
+        bsdf = material.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+            bsdf.inputs["Roughness"].default_value = roughness
+            bsdf.inputs["Metallic"].default_value = metallic
+        if obj.data.materials:
+            obj.data.materials[0] = material
+        else:
+            obj.data.materials.append(material)
+
+
+def _create_trail(name: str, points: List[Sequence[float]], color: Tuple[float, float, float], width: float = 0.01):
+    if bpy is None or len(points) < 2:
+        return
+    curve = bpy.data.curves.new(name=f"{name}_trail_curve", type="CURVE")
+    curve.dimensions = "3D"
+    spline = curve.splines.new(type="POLY")
+    spline.points.add(len(points) - 1)
+    for idx, pt in enumerate(points):
+        x, y, z = pt
+        spline.points[idx].co = (float(x), float(y), float(z), 1.0)
+    curve.bevel_depth = width
+    curve.bevel_resolution = 2
+    curve_obj = bpy.data.objects.new(f"{name}_trail", curve)
+    bpy.context.collection.objects.link(curve_obj)
+    _assign_material(curve_obj, color, roughness=0.4, metallic=0.0)
+
+
+def _setup_environment(scene, include_floor: bool = True):
+    # FLOOR: z= -1
+    if bpy is None:
+        return
+    # Ambient light
+    scene.world.use_nodes = True
+    bg = scene.world.node_tree.nodes["Background"]
+    bg.inputs["Color"].default_value = (0.70, 0.70, 0.72, 1.0)
+    bg.inputs["Strength"].default_value = 0.2
+
+    if include_floor:
+        # Floor plane
+        bpy.ops.mesh.primitive_plane_add(size=60)
+        floor = bpy.context.object
+        floor.name = "Floor"
+        _assign_material(floor, (0.55, 0.55, 0.55), roughness=0.85)
+        floor.location = (0.0, 0.0, -1)
+
+        # Backdrop wall
+        bpy.ops.mesh.primitive_plane_add(size=60)
+        wall = bpy.context.object
+        wall.name = "Backdrop"
+        wall.rotation_euler = (1.5708, 0.0, 0.0)
+        wall.location = (0.0, -30.0, 30.0)
+        _assign_material(wall, (0.78, 0.78, 0.80), roughness=0.9)
+
+    # Key light
+    key_data = bpy.data.lights.new("KeyLight", type="AREA")
+    key_data.energy = 1200
+    key_data.color = (1.0, 0.92, 0.82)
+    key_data.size = 7
+    key = bpy.data.objects.new("KeyLight", key_data)
+    key.location = (6.0, -6.0, 8.0)
+    key.rotation_euler = (1.1, 0.0, 0.8)
+    bpy.context.collection.objects.link(key)
+
+    # Fill light
+    fill_data = bpy.data.lights.new("FillLight", type="AREA")
+    fill_data.energy = 500
+    fill_data.color = (0.78, 0.86, 1.0)
+    fill_data.size = 6
+    fill = bpy.data.objects.new("FillLight", fill_data)
+    fill.location = (-6.0, 6.0, 7.0)
+    fill.rotation_euler = (1.2, 0.0, -0.7)
+    bpy.context.collection.objects.link(fill)
+
+    # Rim light
+    rim_data = bpy.data.lights.new("RimLight", type="SPOT")
+    rim_data.energy = 400
+    rim_data.color = (1.0, 0.95, 0.90)
+    rim_data.spot_size = 1.0
+    rim_data.shadow_soft_size = 1.5
+    rim = bpy.data.objects.new("RimLight", rim_data)
+    rim.location = (0.0, 0.0, 10.0)
+    rim.rotation_euler = (1.4, 0.0, 0.0)
+    bpy.context.collection.objects.link(rim)
+
+    # Overhead soft fill
+    top_data = bpy.data.lights.new("TopFill", type="AREA")
+    top_data.energy = 900
+    top_data.size = 14
+    top_data.color = (1.0, 0.96, 0.90)
+    top = bpy.data.objects.new("TopFill", top_data)
+    top.location = (0.0, 0.0, 9.0)
+    top.rotation_euler = (3.1416, 0.0, 0.0)
+    bpy.context.collection.objects.link(top)
+
+    # Overhead light
+    top_data = bpy.data.lights.new("TopFill", type="AREA")
+    top_data.energy = 900
+    top_data.size = 14
+    top_data.color = (1.0, 0.96, 0.90)
+    top = bpy.data.objects.new("TopFill", top_data)
+    top.location = (0.0, 0.0, 9.0)
+    top.rotation_euler = (3.1416, 0.0, 0.0)
+    bpy.context.collection.objects.link(top)
+
+
+def _configure_eevee(scene):
+    eevee = getattr(scene, "eevee", None)
+    if eevee is None:
+        return
+    if hasattr(eevee, "use_soft_shadows"):
+        eevee.use_soft_shadows = True
+    if hasattr(eevee, "use_gtao"):
+        eevee.use_gtao = True
+        if hasattr(eevee, "gtao_distance"):
+            eevee.gtao_distance = 0.8
+        if hasattr(eevee, "gtao_factor"):
+            eevee.gtao_factor = 1.0
+    if hasattr(eevee, "use_bloom"):
+        eevee.use_bloom = True
+        if hasattr(eevee, "bloom_threshold"):
+            eevee.bloom_threshold = 1.0
+        if hasattr(eevee, "bloom_intensity"):
+            eevee.bloom_intensity = 0.05
+    view_settings = getattr(scene, "view_settings", None)
+    if view_settings:
+        view_settings.view_transform = "Filmic"
+        view_settings.look = "High Contrast"
+        view_settings.exposure = -0.35
+        view_settings.gamma = 1.0
+
+
+def render_assets_with_blender(
+    asset_dir: str,
+    output_dir: str,
+    target_frame: int = 50,
+    allocentric_step: int = 30,
+    external_camera_location: Tuple[float, float, float] = (1.5, -1.5, 1.0),
+    external_camera_target: Tuple[float, float, float] = (0.0, 0.0, 0.3),
+    blend_save_path: str | None = None,
+    hand_colors: Tuple[str, str] = ("blue1", "blue2"),
+    object_color: str = "pink",
+) -> None:
+    if bpy is None:
+        raise RuntimeError(
+            "render_assets_with_blender must be executed within Blender's Python "
+            "environment (bpy is unavailable)."
+        )
+
+    _ensure_logger()
+    global _HAND_COLOR_SELECTION, _OBJECT_COLOR_SELECTION
+    _HAND_COLOR_SELECTION = hand_colors
+    _OBJECT_COLOR_SELECTION = object_color
+    asset_dir = osp.abspath(asset_dir)
+    output_dir = osp.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    frame_assets = _list_asset_files(asset_dir)
+    if not frame_assets:
+        raise FileNotFoundError(f"No asset bundles found under {asset_dir}")
+
+    scene = bpy.context.scene
+
+    target_idx = min(target_frame, len(frame_assets) - 1)
+    LOGGER.info(
+        "Rendering predicted camera view for frame %d (using %s)",
+        target_idx,
+        frame_assets[target_idx],
+    )
+
+    _clear_scene()
+    _setup_environment(scene, include_floor=False)
+    _choose_render_engine(scene)
+    _configure_eevee(scene)
+
+    frame_data = _load_asset_bundle(frame_assets[target_idx])
+    alloc_camera_info = frame_data.get("alloc_camera")
+    for mesh_info in frame_data["meshes"]:
+        _build_mesh(mesh_info)
+    _configure_camera_from_assets(frame_data["camera"])
+    input_frame = frame_data.get("image_path")
+    if input_frame and osp.exists(input_frame):
+        try:
+            Image.open(input_frame).save(osp.join(output_dir, f"{target_idx:04d}_input.png"))
+        except Exception as exc:
+            LOGGER.warning("Failed to save input frame %s: %s", input_frame, exc)
+
+    pred_output_path = osp.join(output_dir, f"{target_idx:04d}_camera.png")
+    bpy.context.scene.render.filepath = pred_output_path
+    bpy.ops.render.render(write_still=True)
+    LOGGER.info("Saved predicted camera render to %s", pred_output_path)
+
+    if blend_save_path:
+        blend_save_path = osp.abspath(blend_save_path)
+        os.makedirs(osp.dirname(blend_save_path), exist_ok=True)
+        LOGGER.info("Saving Blender scene to %s", blend_save_path)
+        bpy.ops.wm.save_as_mainfile(filepath=blend_save_path)
+
+    LOGGER.info(
+        "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
+        allocentric_step,
+        len(frame_assets),
+    )
+
+    _clear_scene()
+    _setup_environment(scene, include_floor=True)
+    _choose_render_engine(scene)
+    _configure_eevee(scene)
+    sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
+    if sampled_indices[-1] != len(frame_assets) - 1:
+        sampled_indices.append(len(frame_assets) - 1)
+
+    trail_points = {"left": [], "right": []}
+    for path in frame_assets:
+        frame_assets_full = _load_asset_bundle(path)
+        for mesh_info in frame_assets_full["meshes"]:
+            verts = mesh_info.get("vertices")
+            if verts is None or len(verts) == 0:
+                continue
+            name = mesh_info.get("name", "").lower()
+            if "left_hand" in name:
+                trail_points["left"].append(verts[0])
+            elif "right_hand" in name:
+                trail_points["right"].append(verts[0])
+
+
+    for order, idx in enumerate(sampled_indices):
+        assets = _load_asset_bundle(frame_assets[idx])
+        frame_factor = idx / max(len(frame_assets) - 1, 1)
+        for mesh_info in assets["meshes"]:
+            mesh_info = dict(mesh_info)
+            mesh_info["name"] = f"{mesh_info['name']}_t{idx:04d}"
+            base_color = np.array(mesh_info.get("color", [0.8, 0.8, 0.8, 1.0]), dtype=np.float32)
+            blended = np.clip(base_color * (0.6 + 0.4 * (1 - frame_factor)), 0.0, 1.0)
+            mesh_info["color"] = blended.tolist()
+            mesh_info["alpha"] = 1
+            _build_mesh(mesh_info)
+
+    _create_trail(
+        "left_hand",
+        trail_points["left"],
+        COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
+        width=0.0012,
+    )
+    _create_trail(
+        "right_hand",
+        trail_points["right"],
+        COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
+        width=0.0012,
+    )
+
+    scene = bpy.context.scene
+    _choose_render_engine(scene)
+    if alloc_camera_info is not None:
+        cam_obj, _ = _configure_camera_from_assets(alloc_camera_info)
+    else:
+        scene.render.resolution_x = 1920
+        scene.render.resolution_y = 1080
+        scene.render.resolution_percentage = 100
+        scene.render.film_transparent = True
+
+        alloc_cam_data = bpy.data.cameras.new("AllocentricCamera")
+        alloc_cam_obj = bpy.data.objects.new("AllocentricCamera", alloc_cam_data)
+        bpy.context.collection.objects.link(alloc_cam_obj)
+        alloc_cam_obj.location = Vector(external_camera_location)
+        _look_at(alloc_cam_obj, external_camera_target)
+        alloc_cam_data.lens = 35.0
+        scene.camera = alloc_cam_obj
+
+    allocentric_path = osp.join(output_dir, "allocentric_overlay.png")
+    bpy.context.scene.render.filepath = allocentric_path
+    bpy.ops.render.render(write_still=True)
+    LOGGER.info("Saved allocentric overlay render to %s", allocentric_path)
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Blender utilities")
+    parser.add_argument(
+        "--mode",
+        choices=["smoke", "render_sphere", "render_assets"],
+        default="render_assets",
+        help="Operation to perform.",
+    )
+    parser.add_argument(
+        "--blender-root",
+        help="Path to the unpacked Blender directory (e.g. blender-4.3.2-linux-x64)",
+        default='/move/u/yufeiy2/Package/blender-4.3.2-linux-x64'
+    )
+    parser.add_argument(
+        "--blender-exe",
+        help="Optional explicit path to the Blender executable; "
+        "defaults to <root>/blender",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory for rendered images "
+        "(render_sphere and render_assets modes).",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=512,
+        help="Image resolution (square) when rendering the sphere.",
+    )
+    parser.add_argument(
+        "--image-name",
+        default="unit_sphere.png",
+        help="Filename for the rendered image.",
+    )
+    parser.add_argument(
+        "--asset-dir",
+        help="Directory containing per-frame asset pickles (render_assets mode).",
+    )
+    parser.add_argument(
+        "--target-frame",
+        type=int,
+        default=50,
+        help="Frame index to render from the predicted camera (render_assets mode).",
+    )
+    parser.add_argument(
+        "--allocentric-step",
+        type=int,
+        default=50,
+        help="Stride when sampling frames for the allocentric overlay.",
+    )
+    parser.add_argument(
+        "--external-camera-location",
+        nargs=3,
+        type=float,
+        default=(1., -2., .5),
+        metavar=("X", "Y", "Z"),
+        help="Allocentric camera location (render_assets mode).",
+    )
+    parser.add_argument(
+        "--external-camera-target",
+        nargs=3,
+        type=float,
+        default=(0.0, 0.0, 0.),
+        metavar=("X", "Y", "Z"),
+        help="Point the allocentric camera looks at (render_assets mode).",
+    )
+    parser.add_argument(
+        "--save-blend",
+        help="If provided in render_assets mode, save the constructed scene to this .blend file.",
+    )
+    parser.add_argument(
+        "--hand-color",
+        default="blue1,blue2",
+        help="Comma-separated colors for left and right hands "
+             f"(options: {', '.join(sorted(COLOR_CHOICES))}).",
+    )
+    parser.add_argument(
+        "--object-color",
+        default="pink",
+        help=f"Object color name (options: {', '.join(sorted(COLOR_CHOICES))}).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    if argv is None:
+        raw_argv = sys.argv[1:]
+        if "--" in raw_argv:
+            idx = raw_argv.index("--")
+            raw_argv = raw_argv[idx + 1 :]
+        args = parse_args(raw_argv)
+    else:
+        args = parse_args(argv)
+    if args.mode == "render_assets":
+        if not args.output_dir:
+            raise ValueError("--output-dir is required when --mode=render_assets")
+        if not args.asset_dir:
+            raise ValueError("--asset-dir is required when --mode=render_assets")
+        try:
+            hand_colors = _parse_hand_colors(args.hand_color)
+            object_color = _validate_color_name(args.object_color)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        render_assets_with_blender(
+            asset_dir=args.asset_dir,
+            output_dir=args.output_dir,
+            target_frame=args.target_frame,
+            allocentric_step=args.allocentric_step,
+            external_camera_location=tuple(args.external_camera_location),
+            external_camera_target=tuple(args.external_camera_target),
+            blend_save_path=args.save_blend,
+            hand_colors=hand_colors,
+            object_color=object_color,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
+
+
+if __name__ == "__main__":
+    main()
+
