@@ -28,6 +28,7 @@ COLOR_CHOICES: Dict[str, Tuple[float, float, float]] = {
     "blue1": (0.45, 0.63, 0.95),
     "blue2": (0.60, 0.75, 0.98),
     "pink": (0.94, 0.66, 0.86),
+    "darkgray": (0.25, 0.25, 0.25),
 }
 
 DEFAULT_HAND_COLORS: Tuple[str, str] = ("blue1", "blue2")
@@ -282,24 +283,6 @@ def _configure_camera_from_assets(camera_assets: Dict) -> Tuple[object, object]:
     height = int(camera_assets["height"])
     K = np.asarray(camera_assets["intrinsic"], dtype=np.float32)
     wTc_pytorch3d = np.asarray(camera_assets["extrinsic_wTc"], dtype=np.float32)
-    # The saved extrinsics come from PyTorch3D where camera axes are:
-    #   +X left, +Y up, +Z forward.
-    # Blender expects camera local axes:
-    #   +X right, +Y up,  camera looks along -Z.
-    # Flip X and Z to convert PyTorch3D camera coordinates into Blender's convention.
- 
-    # Coordinate conversion matrix
-    # PyTorch3D: +X right, +Y up, +Z forward (away from camera)
-    # Blender:   +X right, +Y forward, +Z up
-    # conv_matrix = np.array([[1,  0,  0, 0],
-    #                         [0,  0,  1, 0],
-    #                         [0, -1,  0, 0],
-    #                         [0,  0,  0, 1]], dtype=np.float32)
-
-    # conv_matrix = np.eye(4)
-    
-    # Apply coordinate conversion: wTc_blender = Conv @ wTc_pytorch3d @ Conv^T
-    # wTc_blender = conv_matrix @ wTc_pytorch3d @ conv_matrix.T
 
     wTc_blender = pytorch3d_to_blender_camera(wTc_pytorch3d)
 
@@ -370,6 +353,47 @@ def _create_trail(name: str, points: List[Sequence[float]], color: Tuple[float, 
     bpy.context.collection.objects.link(curve_obj)
     _assign_material(curve_obj, color, roughness=0.4, metallic=0.0)
 
+def _create_camera_wireframe(name: str, mat: np.ndarray, size: float = 0.05):
+    if bpy is None:
+        return None
+    
+    # Define the pyramid vertices
+    apex = (0.0, 0.0, 0.0)
+    corners = [
+        (-size, -size, -size * 1.5),
+        (size, -size, -size * 1.5),
+        (size, size, -size * 1.5),
+        (-size, size, -size * 1.5),
+    ]
+    
+    # Create a curve for each edge
+    curve_data = bpy.data.curves.new(name=f"{name}_cam_curve", type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.bevel_depth = 0.002  # Thickness of the wireframe lines
+    curve_data.bevel_resolution = 2
+    
+    # Edges from apex to corners
+    for corner in corners:
+        spline = curve_data.splines.new(type='POLY')
+        spline.points.add(1)  # Add one more point (total 2)
+        spline.points[0].co = (*apex, 1.0)
+        spline.points[1].co = (*corner, 1.0)
+    
+    # Edges around the base
+    for i in range(4):
+        spline = curve_data.splines.new(type='POLY')
+        spline.points.add(1)
+        spline.points[0].co = (*corners[i], 1.0)
+        spline.points[1].co = (*corners[(i + 1) % 4], 1.0)
+    
+    obj = bpy.data.objects.new(f"{name}_camera", curve_data)
+    bpy.context.collection.objects.link(obj)
+    obj.matrix_world = Matrix([tuple(row) for row in mat])
+    
+    # Assign material for proper rendering
+    _assign_material(obj, COLOR_CHOICES["darkgray"], roughness=0.6, metallic=0.0)
+    
+    return obj
 
 def _setup_environment(scene, include_floor: bool = True):
     # FLOOR: z= -1
@@ -386,7 +410,7 @@ def _setup_environment(scene, include_floor: bool = True):
         bpy.ops.mesh.primitive_plane_add(size=60)
         floor = bpy.context.object
         floor.name = "Floor"
-        _assign_material(floor, (0.55, 0.55, 0.55), roughness=0.85)
+        _assign_material(floor, (0.96, 0.96, 0.96), roughness=0.85)
         floor.location = (0.0, 0.0, -1)
 
         # Backdrop wall
@@ -485,6 +509,7 @@ def render_assets_with_blender(
     blend_save_path: str | None = None,
     hand_colors: Tuple[str, str] = ("blue1", "blue2"),
     object_color: str = "pink",
+    render_camera: bool = False,
 ) -> None:
     if bpy is None:
         raise RuntimeError(
@@ -555,7 +580,7 @@ def render_assets_with_blender(
     if sampled_indices[-1] != len(frame_assets) - 1:
         sampled_indices.append(len(frame_assets) - 1)
 
-    trail_points = {"left": [], "right": []}
+    trail_points = {"left": [], "right": [], "camera": []}
     for path in frame_assets:
         frame_assets_full = _load_asset_bundle(path)
         for mesh_info in frame_assets_full["meshes"]:
@@ -567,6 +592,11 @@ def render_assets_with_blender(
                 trail_points["left"].append(verts[0])
             elif "right_hand" in name:
                 trail_points["right"].append(verts[0])
+        camera_info_full = frame_assets_full.get("camera")
+        if camera_info_full is not None:
+            wTc_full = np.asarray(camera_info_full.get("extrinsic_wTc"), dtype=np.float32)
+            cam_mat_full = pytorch3d_to_blender_camera(wTc_full)
+            trail_points["camera"].append(cam_mat_full[:3, 3].tolist())
 
 
     for order, idx in enumerate(sampled_indices):
@@ -580,19 +610,36 @@ def render_assets_with_blender(
             mesh_info["color"] = blended.tolist()
             mesh_info["alpha"] = 1
             _build_mesh(mesh_info)
+        if render_camera:
+            camera_info = assets.get("camera")
+            if camera_info is not None:
+                wTc_pred = np.asarray(camera_info.get("extrinsic_wTc"), dtype=np.float32)
+                wireframe_mat = pytorch3d_to_blender_camera(wTc_pred)
+                _create_camera_wireframe(
+                    f"predicted_cam_t{idx:04d}",
+                    wireframe_mat,
+                    size=0.05,
+                )
 
     _create_trail(
         "left_hand",
         trail_points["left"],
         COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
-        width=0.0012,
+        width=0.002,
     )
     _create_trail(
         "right_hand",
         trail_points["right"],
         COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
-        width=0.0012,
+        width=0.002,
     )
+    if render_camera:
+        _create_trail(
+            "predicted_camera",
+            trail_points["camera"],
+            COLOR_CHOICES["darkgray"],
+            width=0.0015,
+        )
 
     scene = bpy.context.scene
     _choose_render_engine(scene)
@@ -699,6 +746,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="pink",
         help=f"Object color name (options: {', '.join(sorted(COLOR_CHOICES))}).",
     )
+    parser.add_argument(
+        "--render-camera",
+        action="store_true",
+        help="If set, draw allocentric camera wireframes for sampled frames.",
+    )
     return parser.parse_args(argv)
 
 
@@ -731,6 +783,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             blend_save_path=args.save_blend,
             hand_colors=hand_colors,
             object_color=object_color,
+            render_camera=args.render_camera,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
