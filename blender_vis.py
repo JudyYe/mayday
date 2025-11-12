@@ -37,6 +37,7 @@ DEFAULT_OBJECT_COLOR: str = "pink"
 
 _HAND_COLOR_SELECTION: Tuple[str, str] = DEFAULT_HAND_COLORS
 _OBJECT_COLOR_SELECTION: str = DEFAULT_OBJECT_COLOR
+_VIS_CONTACT: bool = False
 
 
 def _validate_color_name(name: str) -> str:
@@ -57,6 +58,24 @@ def _parse_hand_colors(option: str) -> Tuple[str, str]:
     elif len(parts) > 2:
         parts = parts[:2]
     return (_validate_color_name(parts[0]), _validate_color_name(parts[1]))
+
+
+def _apply_contact_color(mesh_info: Dict) -> Dict:
+    if not _VIS_CONTACT:
+        return mesh_info
+    color = mesh_info.get("color")
+    if color is None:
+        return mesh_info
+    color_arr = np.asarray(color, dtype=np.float32)
+    if color_arr.size < 3:
+        return mesh_info
+    if np.allclose(color_arr[:3], 1.0, atol=1e-3):
+        red = COLOR_CHOICES["red"]
+        alpha = float(color_arr[3]) if color_arr.size >= 4 else 1.0
+        mesh_info["color"] = [red[0], red[1], red[2], alpha]
+        mesh_info["force_color"] = True
+        mesh_info["alpha"] = alpha
+    return mesh_info
 
 try:
     import bpy  # type: ignore
@@ -216,10 +235,14 @@ def _build_mesh(mesh_info: Dict, stylized: bool = True):
     mesh_obj = bpy.data.objects.new(name, mesh_data)
     bpy.context.collection.objects.link(mesh_obj)
 
-    if stylized:
+    force_color = bool(mesh_info.get("force_color"))
+    if stylized and not force_color:
         palette_color = _mesh_color_palette(name, color)
         roughness, metallic = _material_params(name)
         _assign_material(mesh_obj, palette_color, roughness=roughness, metallic=metallic, alpha=alpha)
+    else:
+        force_palette = tuple(color[:3]) if len(color) >= 3 else (0.8, 0.8, 0.8)
+        _assign_material(mesh_obj, force_palette, roughness=0.3, metallic=0.0, alpha=alpha)
     return mesh_obj
 
 
@@ -667,7 +690,7 @@ def render_assets_with_blender(
     asset_dir: str,
     output_dir: str,
     target_frame: int = 50,
-    allocentric_step: int = 30,
+    allocentric_step: int = 50,
     external_camera_location: Tuple[float, float, float] = (1.5, -1.5, 1.0),
     external_camera_target: Tuple[float, float, float] = (0.0, 0.0, 0.3),
     blend_save_path: str | None = None,
@@ -675,6 +698,9 @@ def render_assets_with_blender(
     object_color: str = "pink",
     render_camera: bool = False,
     render_trail: bool = True,
+    render_allocentric: bool = True,
+    render_target_frame: bool = True,
+    vis_contact: bool = False,
 ) -> None:
     if bpy is None:
         raise RuntimeError(
@@ -683,9 +709,10 @@ def render_assets_with_blender(
         )
 
     _ensure_logger()
-    global _HAND_COLOR_SELECTION, _OBJECT_COLOR_SELECTION
+    global _HAND_COLOR_SELECTION, _OBJECT_COLOR_SELECTION, _VIS_CONTACT
     _HAND_COLOR_SELECTION = hand_colors
     _OBJECT_COLOR_SELECTION = object_color
+    _VIS_CONTACT = vis_contact
     asset_dir = osp.abspath(asset_dir)
     output_dir = osp.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -697,163 +724,172 @@ def render_assets_with_blender(
     scene = bpy.context.scene
 
     target_idx = min(target_frame, len(frame_assets) - 1)
-    LOGGER.info(
-        "Rendering predicted camera view for frame %d (using %s)",
-        target_idx,
-        frame_assets[target_idx],
-    )
-
-    _clear_scene()
-    _setup_environment(scene, include_floor=False)
-    _choose_render_engine(scene)
-    _configure_eevee(scene)
-
     frame_data = _load_asset_bundle(frame_assets[target_idx])
     alloc_camera_info = frame_data.get("alloc_camera")
-    for mesh_info in frame_data["meshes"]:
-        _build_mesh(mesh_info)
-    _configure_camera_from_assets(frame_data["camera"])
-    input_frame = frame_data.get("image_path")
-    if input_frame and osp.exists(input_frame):
-        try:
-            Image.open(input_frame).save(osp.join(output_dir, f"{target_idx:04d}_input.png"))
-        except Exception as exc:
-            LOGGER.warning("Failed to save input frame %s: %s", input_frame, exc)
+    if render_target_frame:
+        LOGGER.info(
+            "Rendering predicted camera view for frame %d (using %s)",
+            target_idx,
+            frame_assets[target_idx],
+        )
 
-    pred_output_path = osp.join(output_dir, f"{target_idx:04d}_camera.png")
-    bpy.context.scene.render.filepath = pred_output_path
-    bpy.ops.render.render(write_still=True)
-    LOGGER.info("Saved predicted camera render to %s", pred_output_path)
+        _clear_scene()
+        _setup_environment(scene, include_floor=False)
+        _choose_render_engine(scene)
+        _configure_eevee(scene)
 
-    LOGGER.info(
-        "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
-        allocentric_step,
-        len(frame_assets),
-    )
+        for mesh_info in frame_data["meshes"]:
+            _build_mesh(_apply_contact_color(dict(mesh_info)))
+        _configure_camera_from_assets(frame_data["camera"])
+        input_frame = frame_data.get("image_path")
+        if input_frame and osp.exists(input_frame):
+            try:
+                Image.open(input_frame).save(osp.join(output_dir, f"{target_idx:04d}_input.png"))
+            except Exception as exc:
+                LOGGER.warning("Failed to save input frame %s: %s", input_frame, exc)
 
-    camera_positions: List[np.ndarray] = []
-    trail_points = {"left": [], "right": [], "camera": []}
-    for path in frame_assets:
-        frame_assets_full = _load_asset_bundle(path)
-        camera_info_full = frame_assets_full.get("camera")
-        if camera_info_full is not None:
-            wTc_full = np.asarray(camera_info_full.get("extrinsic_wTc"), dtype=np.float32)
-            cam_mat_full = pytorch3d_to_blender_camera(wTc_full)
-            cam_pos = cam_mat_full[:3, 3]
-            camera_positions.append(cam_pos)
+        pred_output_path = osp.join(output_dir, f"{target_idx:04d}_camera.png")
+        bpy.context.scene.render.filepath = pred_output_path
+        bpy.ops.render.render(write_still=True)
+        LOGGER.info("Saved predicted camera render to %s", pred_output_path)
+    else:
+        LOGGER.info("Skipping predicted camera render (--no-render-target-frame specified).")
+
+    if render_allocentric:
+        LOGGER.info(
+            "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
+            allocentric_step,
+            len(frame_assets),
+        )
+
+        camera_positions: List[np.ndarray] = []
+        trail_points = {"left": [], "right": [], "camera": []}
+        for path in frame_assets:
+            frame_assets_full = _load_asset_bundle(path)
+            camera_info_full = frame_assets_full.get("camera")
+            if camera_info_full is not None:
+                wTc_full = np.asarray(camera_info_full.get("extrinsic_wTc"), dtype=np.float32)
+                cam_mat_full = pytorch3d_to_blender_camera(wTc_full)
+                cam_pos = cam_mat_full[:3, 3]
+                camera_positions.append(cam_pos)
+                if render_trail:
+                    trail_points["camera"].append(cam_pos.tolist())
             if render_trail:
-                trail_points["camera"].append(cam_pos.tolist())
-        if render_trail:
-            for mesh_info in frame_assets_full["meshes"]:
-                verts = mesh_info.get("vertices")
-                if verts is None or len(verts) == 0:
-                    continue
-                name = mesh_info.get("name", "").lower()
-                if "left_hand" in name:
-                    trail_points["left"].append(verts[0])
-                elif "right_hand" in name:
-                    trail_points["right"].append(verts[0])
+                for mesh_info in frame_assets_full["meshes"]:
+                    verts = mesh_info.get("vertices")
+                    if verts is None or len(verts) == 0:
+                        continue
+                    name = mesh_info.get("name", "").lower()
+                    if "left_hand" in name:
+                        trail_points["left"].append(verts[0])
+                    elif "right_hand" in name:
+                        trail_points["right"].append(verts[0])
 
-    floor_center: Tuple[float, float, float] | None = None
-    if alloc_camera_info is not None:
-        alloc_wTc = np.asarray(alloc_camera_info.get("extrinsic_wTc"), dtype=np.float32)
-        alloc_mat = pytorch3d_to_blender_camera(alloc_wTc)
-        alloc_pos = alloc_mat[:3, 3]
-        floor_center = (
-            float(alloc_pos[0]),
-            float(alloc_pos[1]) + 1,
-            -1
-        )
-
-    _clear_scene()
-    _setup_environment(scene, include_floor=True, floor_center=floor_center)
-    _choose_render_engine(scene)
-    _configure_eevee(scene)
-    sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
-    if sampled_indices[-1] != len(frame_assets) - 1:
-        sampled_indices.append(len(frame_assets) - 1)
-
-
-    for order, idx in enumerate(sampled_indices):
-        assets = _load_asset_bundle(frame_assets[idx])
-        frame_factor = idx / max(len(frame_assets) - 1, 1)
-        for mesh_info in assets["meshes"]:
-            mesh_info = dict(mesh_info)
-            mesh_info["name"] = f"{mesh_info['name']}_t{idx:04d}"
-            base_color = np.array(mesh_info.get("color", [0.8, 0.8, 0.8, 1.0]), dtype=np.float32)
-            blended = np.clip(base_color * (0.6 + 0.4 * (1 - frame_factor)), 0.0, 1.0)
-            mesh_info["color"] = blended.tolist()
-            mesh_info["alpha"] = 1
-            _build_mesh(mesh_info)
-        if render_camera:
-            camera_info = assets.get("camera")
-            if camera_info is not None:
-                wTc_pred = np.asarray(camera_info.get("extrinsic_wTc"), dtype=np.float32)
-                wireframe_mat = pytorch3d_to_blender_camera(wTc_pred)
-                _create_camera_wireframe(
-                    f"predicted_cam_t{idx:04d}",
-                    wireframe_mat,
-                    size=0.05,
-                )
-
-    if render_trail:
-        _create_trail(
-            "left_hand",
-            trail_points["left"],
-            COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
-            width=0.002,
-        )
-        _create_trail(
-            "right_hand",
-            trail_points["right"],
-            COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
-            width=0.002,
-        )
-        if render_camera:
-            _create_trail(
-                "predicted_camera",
-                trail_points["camera"],
-                COLOR_CHOICES["darkgray"],
-                width=0.0015,
+        floor_center: Tuple[float, float, float] | None = None
+        if alloc_camera_info is not None:
+            alloc_wTc = np.asarray(alloc_camera_info.get("extrinsic_wTc"), dtype=np.float32)
+            alloc_mat = pytorch3d_to_blender_camera(alloc_wTc)
+            alloc_pos = alloc_mat[:3, 3]
+            floor_center = (
+                float(alloc_pos[0]),
+                float(alloc_pos[1]) + 1,
+                -1
             )
 
-    scene = bpy.context.scene
-    _choose_render_engine(scene)
-    if alloc_camera_info is not None:
-        cam_obj, _ = _configure_camera_from_assets(alloc_camera_info)
+        _clear_scene()
+        _setup_environment(scene, include_floor=True, floor_center=floor_center)
+        _choose_render_engine(scene)
+        _configure_eevee(scene)
+        sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
+        if sampled_indices[-1] != len(frame_assets) - 1:
+            sampled_indices.append(len(frame_assets) - 1)
+
+
+        for order, idx in enumerate(sampled_indices):
+            assets = _load_asset_bundle(frame_assets[idx])
+            frame_factor = idx / max(len(frame_assets) - 1, 1)
+            for mesh_info in assets["meshes"]:
+                mesh_info = _apply_contact_color(dict(mesh_info))
+                mesh_info["name"] = f"{mesh_info['name']}_t{idx:04d}"
+                base_color = np.array(mesh_info.get("color", [0.8, 0.8, 0.8, 1.0]), dtype=np.float32)
+                if _VIS_CONTACT and np.allclose(base_color[:3], COLOR_CHOICES["red"], atol=1e-3):
+                    mesh_info["color"] = [*COLOR_CHOICES["red"], float(base_color[3] if base_color.size == 4 else 1.0)]
+                else:
+                    blended = np.clip(base_color * (0.6 + 0.4 * (1 - frame_factor)), 0.0, 1.0)
+                    mesh_info["color"] = blended.tolist()
+                mesh_info["alpha"] = 1
+                _build_mesh(mesh_info)
+            if render_camera:
+                camera_info = assets.get("camera")
+                if camera_info is not None:
+                    wTc_pred = np.asarray(camera_info.get("extrinsic_wTc"), dtype=np.float32)
+                    wireframe_mat = pytorch3d_to_blender_camera(wTc_pred)
+                    _create_camera_wireframe(
+                        f"predicted_cam_t{idx:04d}",
+                        wireframe_mat,
+                        size=0.05,
+                    )
+
+        if render_trail:
+            _create_trail(
+                "left_hand",
+                trail_points["left"],
+                COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
+                width=0.002,
+            )
+            _create_trail(
+                "right_hand",
+                trail_points["right"],
+                COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
+                width=0.002,
+            )
+            if render_camera:
+                _create_trail(
+                    "predicted_camera",
+                    trail_points["camera"],
+                    COLOR_CHOICES["darkgray"],
+                    width=0.0015,
+                )
+
+        scene = bpy.context.scene
+        _choose_render_engine(scene)
+        if alloc_camera_info is not None:
+            cam_obj, _ = _configure_camera_from_assets(alloc_camera_info)
+        else:
+            # scene.render.resolution_x = 1920
+            # scene.render.resolution_y = 1080
+            # get a 4:3
+            scene.render.resolution_x = 1440
+            scene.render.resolution_y = 1080
+            scene.render.resolution_percentage = 100
+            scene.render.film_transparent = True
+
+            alloc_cam_data = bpy.data.cameras.new("AllocentricCamera")
+            alloc_cam_obj = bpy.data.objects.new("AllocentricCamera", alloc_cam_data)
+            bpy.context.collection.objects.link(alloc_cam_obj)
+            alloc_cam_obj.location = Vector(external_camera_location)
+            _look_at(alloc_cam_obj, external_camera_target)
+            alloc_cam_data.lens = 35.0
+            scene.camera = alloc_cam_obj
+
+        allocentric_path = osp.join(output_dir, "allocentric_overlay.png")
+        bpy.context.scene.render.filepath = allocentric_path
+        bpy.ops.render.render(write_still=True)
+        LOGGER.info("Saved allocentric overlay render to %s", allocentric_path)
+
+        if alloc_camera_info is not None:
+            export_camera = {}
+            for key, value in alloc_camera_info.items():
+                if isinstance(value, np.ndarray):
+                    export_camera[key] = value.tolist()
+                else:
+                    export_camera[key] = value
+            camera_export_path = osp.join(output_dir, "allocentric_camera.json")
+            with open(camera_export_path, "w", encoding="utf-8") as f:
+                json.dump(export_camera, f, indent=2)
+            LOGGER.info("Saved allocentric camera parameters to %s", camera_export_path)
     else:
-        # scene.render.resolution_x = 1920
-        # scene.render.resolution_y = 1080
-        # get a 4:3
-        scene.render.resolution_x = 1440
-        scene.render.resolution_y = 1080
-        scene.render.resolution_percentage = 100
-        scene.render.film_transparent = True
-
-        alloc_cam_data = bpy.data.cameras.new("AllocentricCamera")
-        alloc_cam_obj = bpy.data.objects.new("AllocentricCamera", alloc_cam_data)
-        bpy.context.collection.objects.link(alloc_cam_obj)
-        alloc_cam_obj.location = Vector(external_camera_location)
-        _look_at(alloc_cam_obj, external_camera_target)
-        alloc_cam_data.lens = 35.0
-        scene.camera = alloc_cam_obj
-
-    allocentric_path = osp.join(output_dir, "allocentric_overlay.png")
-    bpy.context.scene.render.filepath = allocentric_path
-    bpy.ops.render.render(write_still=True)
-    LOGGER.info("Saved allocentric overlay render to %s", allocentric_path)
-
-    if alloc_camera_info is not None:
-        export_camera = {}
-        for key, value in alloc_camera_info.items():
-            if isinstance(value, np.ndarray):
-                export_camera[key] = value.tolist()
-            else:
-                export_camera[key] = value
-        camera_export_path = osp.join(output_dir, "allocentric_camera.json")
-        with open(camera_export_path, "w", encoding="utf-8") as f:
-            json.dump(export_camera, f, indent=2)
-        LOGGER.info("Saved allocentric camera parameters to %s", camera_export_path)
+        LOGGER.info("Skipping allocentric overlay render (--no-render-allocentric specified).")
 
     if blend_save_path:
         blend_save_path = osp.abspath(blend_save_path)
@@ -949,6 +985,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="If set, draw allocentric camera wireframes for sampled frames.",
     )
     parser.add_argument(
+        "--render-allocentric",
+        dest="render_allocentric",
+        action="store_true",
+        help="Render allocentric overlay for sampled frames.",
+    )
+    parser.add_argument(
+        "--no-render-allocentric",
+        dest="render_allocentric",
+        action="store_false",
+        help="Disable allocentric overlay render.",
+    )
+    parser.add_argument(
         "--render-trail",
         dest="render_trail",
         action="store_true",
@@ -960,7 +1008,36 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_false",
         help="Disable hand and camera motion trails.",
     )
-    parser.set_defaults(render_trail=True)
+    parser.add_argument(
+        "--render-target-frame",
+        dest="render_target_frame",
+        action="store_true",
+        help="Render the predicted camera view for the target frame.",
+    )
+    parser.add_argument(
+        "--no-render-target-frame",
+        dest="render_target_frame",
+        action="store_false",
+        help="Disable predicted camera rendering for the target frame.",
+    )
+    parser.add_argument(
+        "--vis-contact",
+        dest="vis_contact",
+        action="store_true",
+        help="Highlight contact vertices using the red palette color.",
+    )
+    parser.add_argument(
+        "--no-vis-contact",
+        dest="vis_contact",
+        action="store_false",
+        help="Disable contact highlighting.",
+    )
+    parser.set_defaults(
+        render_trail=True,
+        render_allocentric=True,
+        render_target_frame=True,
+        vis_contact=False,
+    )
     return parser.parse_args(argv)
 
 
@@ -995,6 +1072,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             object_color=object_color,
             render_camera=args.render_camera,
             render_trail=args.render_trail,
+            render_allocentric=args.render_allocentric,
+            render_target_frame=args.render_target_frame,
+            vis_contact=args.vis_contact,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
