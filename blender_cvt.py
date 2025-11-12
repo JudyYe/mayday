@@ -108,7 +108,7 @@ def compute_allocentric_camera(wTc_mats: List[np.ndarray]) -> Dict[str, np.ndarr
     wTc[:3, 2] = z_cam
     wTc[:3, 3] = cam_pos.astype(np.float32)
 
-    width, height = 1920, 1080
+    width, height = 1440, 1080
     fov = np.deg2rad(40.0)
     fx = fy = 0.5 * height / np.tan(fov / 2.0)
     intr = np.array([[fx, 0.0, width / 2.0], [0.0, fy, height / 2.0], [0.0, 0.0, 1.0]], dtype=np.float32)

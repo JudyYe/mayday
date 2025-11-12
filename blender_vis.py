@@ -9,6 +9,7 @@ This module provides:
 
 import logging
 import argparse
+import json
 import os
 import os.path as osp
 import pickle
@@ -335,6 +336,107 @@ def _assign_material(obj, color, roughness=0.45, metallic=0.0, alpha=1.0):
             obj.data.materials[0] = material
         else:
             obj.data.materials.append(material)
+def _grid_floor_material(
+    name: str = "FloorGrid",
+    base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    line_color: Tuple[float, float, float] = (0.85, 0.85, 0.85),
+    scale: float = 20.0,
+    line_width: float = 0.015,
+):
+    """Create a pure white floor material with gray grid lines."""
+    if bpy is None:
+        return None
+    
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+
+    # Output and Principled BSDF
+    output = nodes.new("ShaderNodeOutputMaterial")
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)  # Pure white
+    principled.inputs["Roughness"].default_value = 1.0
+    principled.inputs["Metallic"].default_value = 0.0
+    principled.inputs["Specular IOR Level"].default_value = 0.0
+
+    # Texture coordinate and mapping
+    tex_coord = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.inputs["Scale"].default_value = (scale, scale, 1.0)
+
+    # Separate XYZ
+    separate = nodes.new("ShaderNodeSeparateXYZ")
+    
+    # X direction processing
+    fract_x = nodes.new("ShaderNodeMath")
+    fract_x.operation = "FRACT"
+    fract_x.label = "Fract X"
+    
+    sub_x = nodes.new("ShaderNodeMath")
+    sub_x.operation = "SUBTRACT"
+    sub_x.inputs[1].default_value = 0.5
+    
+    abs_x = nodes.new("ShaderNodeMath")
+    abs_x.operation = "ABSOLUTE"
+    
+    compare_x = nodes.new("ShaderNodeMath")
+    compare_x.operation = "GREATER_THAN"
+    compare_x.inputs[1].default_value = 0.5 - line_width
+    
+    # Y direction processing
+    fract_y = nodes.new("ShaderNodeMath")
+    fract_y.operation = "FRACT"
+    fract_y.label = "Fract Y"
+    
+    sub_y = nodes.new("ShaderNodeMath")
+    sub_y.operation = "SUBTRACT"
+    sub_y.inputs[1].default_value = 0.5
+    
+    abs_y = nodes.new("ShaderNodeMath")
+    abs_y.operation = "ABSOLUTE"
+    
+    compare_y = nodes.new("ShaderNodeMath")
+    compare_y.operation = "GREATER_THAN"
+    compare_y.inputs[1].default_value = 0.5 - line_width
+    
+    # Combine X and Y
+    combine = nodes.new("ShaderNodeMath")
+    combine.operation = "MAXIMUM"
+    
+    # Mix colors
+    mix = nodes.new("ShaderNodeMix")
+    mix.data_type = 'RGBA'
+    mix.inputs[6].default_value = (*base_color, 1.0)  # A socket - white
+    mix.inputs[7].default_value = (*line_color, 1.0)  # B socket - gray lines
+
+    # Connect everything
+    links.new(tex_coord.outputs["Object"], mapping.inputs["Vector"])
+    links.new(mapping.outputs["Vector"], separate.inputs["Vector"])
+    
+    # X chain
+    links.new(separate.outputs["X"], fract_x.inputs[0])
+    links.new(fract_x.outputs[0], sub_x.inputs[0])
+    links.new(sub_x.outputs[0], abs_x.inputs[0])
+    links.new(abs_x.outputs[0], compare_x.inputs[0])
+    
+    # Y chain
+    links.new(separate.outputs["Y"], fract_y.inputs[0])
+    links.new(fract_y.outputs[0], sub_y.inputs[0])
+    links.new(sub_y.outputs[0], abs_y.inputs[0])
+    links.new(abs_y.outputs[0], compare_y.inputs[0])
+    
+    # Combine and output
+    links.new(compare_x.outputs[0], combine.inputs[0])
+    links.new(compare_y.outputs[0], combine.inputs[1])
+    links.new(combine.outputs[0], mix.inputs[0])  # Factor
+    links.new(mix.outputs[2], principled.inputs["Base Color"])
+    links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+
+    return material
 
 
 def _create_trail(name: str, points: List[Sequence[float]], color: Tuple[float, float, float], width: float = 0.01):
@@ -395,55 +497,117 @@ def _create_camera_wireframe(name: str, mat: np.ndarray, size: float = 0.05):
     
     return obj
 
-def _setup_environment(scene, include_floor: bool = True):
+def _setup_environment(
+    scene,
+    include_floor: bool = True,
+    floor_center: Tuple[float, float, float] | None = None,
+):
     # FLOOR: z= -1
     if bpy is None:
         return
-    # Ambient light
+
+    # Bright, neutral ambient light
     scene.world.use_nodes = True
     bg = scene.world.node_tree.nodes["Background"]
-    bg.inputs["Color"].default_value = (0.70, 0.70, 0.72, 1.0)
-    bg.inputs["Strength"].default_value = 0.2
+    # bg.inputs["Color"].default_value = (0.98, 0.98, 0.98, 1.0)
+    bg.inputs["Color"].default_value = (1, 1, 1, 1.0)
+    bg.inputs["Strength"].default_value = 0.35
 
     if include_floor:
-        # Floor plane
-        bpy.ops.mesh.primitive_plane_add(size=60)
+        if floor_center is not None:
+            floor_x, floor_y, floor_z = (
+                float(floor_center[0]),
+                float(floor_center[1]),
+                float(floor_center[2]),
+            )
+        else:
+            floor_x, floor_y, floor_z = 0.0, 0.0, -1.0
+
+        # Floor plane - larger and properly scaled
+        bpy.ops.mesh.primitive_plane_add(size=2.5, scale=(0.5, 1., 1.))  # wide table
         floor = bpy.context.object
         floor.name = "Floor"
-        _assign_material(floor, (0.96, 0.96, 0.96), roughness=0.85)
-        floor.location = (0.0, 0.0, -1)
+        
+        floor.scale = (1., .5, 1.0)  # This will persist when you save/reopen
 
-        # Backdrop wall
-        bpy.ops.mesh.primitive_plane_add(size=60)
-        wall = bpy.context.object
-        wall.name = "Backdrop"
-        wall.rotation_euler = (1.5708, 0.0, 0.0)
-        wall.location = (0.0, -30.0, 30.0)
-        _assign_material(wall, (0.78, 0.78, 0.80), roughness=0.9)
+        # Apply grid material
+        grid_material = _grid_floor_material(
+            # base_color=(1.0, 1.0, 1.0),  # Pure white
+            base_color=(30., 30., 30.),  # overwhite
+            line_color=(0.88, 0.88, 0.88),  # Light gray lines
+            scale=3.0,  # Grid density
+            line_width=0.015  # Line thickness
+        )
+        if grid_material:
+            if floor.data.materials:
+                floor.data.materials[0] = grid_material
+            else:
+                floor.data.materials.append(grid_material)
+        
+        floor.location = (floor_x, floor_y, floor_z)
+
+    # # Ambient light
+    # scene.world.use_nodes = True
+    # bg = scene.world.node_tree.nodes["Background"]
+    # bg.inputs["Color"].default_value = (0.70, 0.70, 0.72, 1.0)
+    # bg.inputs["Strength"].default_value = 0.2
+
+    # if include_floor:
+    #     # Floor plane
+    #     bpy.ops.mesh.primitive_plane_add(size=60)
+    #     floor = bpy.context.object
+    #     floor.name = "Floor"
+    #     grid_material = _grid_floor_material()
+    #     if grid_material:
+    #         if floor.data.materials:
+    #             floor.data.materials[0] = grid_material
+    #         else:
+    #             floor.data.materials.append(grid_material)
+    #     else:
+    #         _assign_material(floor, (0.96, 0.96, 0.96), roughness=0.85)
+    #     floor.location = (0.0, 0.0, -1)
+
+    #     # Backdrop wall
+    #     bpy.ops.mesh.primitive_plane_add(size=60)
+    #     wall = bpy.context.object
+    #     wall.name = "Backdrop"
+    #     wall.rotation_euler = (1.5708, 0.0, 0.0)
+    #     wall.location = (0.0, -30.0, 30.0)
+    #     _assign_material(wall, (0.78, 0.78, 0.80), roughness=0.9)
 
     # Key light
-    key_data = bpy.data.lights.new("KeyLight", type="AREA")
-    key_data.energy = 1200
-    key_data.color = (1.0, 0.92, 0.82)
-    key_data.size = 7
-    key = bpy.data.objects.new("KeyLight", key_data)
-    key.location = (6.0, -6.0, 8.0)
-    key.rotation_euler = (1.1, 0.0, 0.8)
-    bpy.context.collection.objects.link(key)
+    # key_data = bpy.data.lights.new("KeyLight", type="AREA")
+    # key_data.energy = 1200
+    # key_data.color = (1.0, 0.92, 0.82)
+    # key_data.size = 7
+    # key = bpy.data.objects.new("KeyLight", key_data)
+    # key.location = (6.0, -6.0, 8.0)
+    # key.rotation_euler = (1.1, 0.0, 0.8)
+    # bpy.context.collection.objects.link(key)
 
+
+    # Main directional key light for sharp shadows - pointing downward
+    key_data = bpy.data.lights.new("KeyLight", type="SUN")  # SUN for sharp parallel shadows
+    key_data.energy = 1.6  # Reduce brightness
+    key_data.angle = 0.03  # Slightly softer shadows
+    key = bpy.data.objects.new("KeyLight", key_data)
+    key.location = (5.0, -5.0, 10.0)  # Position above the scene
+    key.rotation_euler = (0.0, 0.0, 0.0)  # Point straight down (-Z direction)
+    bpy.context.collection.objects.link(key)
+    
     # Fill light
     fill_data = bpy.data.lights.new("FillLight", type="AREA")
-    fill_data.energy = 500
+    fill_data.energy = 220
     fill_data.color = (0.78, 0.86, 1.0)
     fill_data.size = 6
     fill = bpy.data.objects.new("FillLight", fill_data)
-    fill.location = (-6.0, 6.0, 7.0)
+    fill.location = (-6.0, -3.0, 1.0)
     fill.rotation_euler = (1.2, 0.0, -0.7)
     bpy.context.collection.objects.link(fill)
 
     # Rim light
     rim_data = bpy.data.lights.new("RimLight", type="SPOT")
-    rim_data.energy = 400
+    rim_data.energy = 280
     rim_data.color = (1.0, 0.95, 0.90)
     rim_data.spot_size = 1.0
     rim_data.shadow_soft_size = 1.5
@@ -454,8 +618,8 @@ def _setup_environment(scene, include_floor: bool = True):
 
     # Overhead soft fill
     top_data = bpy.data.lights.new("TopFill", type="AREA")
-    top_data.energy = 900
-    top_data.size = 14
+    top_data.energy = 220
+    top_data.size = 10
     top_data.color = (1.0, 0.96, 0.90)
     top = bpy.data.objects.new("TopFill", top_data)
     top.location = (0.0, 0.0, 9.0)
@@ -464,8 +628,8 @@ def _setup_environment(scene, include_floor: bool = True):
 
     # Overhead light
     top_data = bpy.data.lights.new("TopFill", type="AREA")
-    top_data.energy = 900
-    top_data.size = 14
+    top_data.energy = 320
+    top_data.size = 10
     top_data.color = (1.0, 0.96, 0.90)
     top = bpy.data.objects.new("TopFill", top_data)
     top.location = (0.0, 0.0, 9.0)
@@ -495,7 +659,7 @@ def _configure_eevee(scene):
     if view_settings:
         view_settings.view_transform = "Filmic"
         view_settings.look = "High Contrast"
-        view_settings.exposure = -0.35
+        view_settings.exposure = -0.6
         view_settings.gamma = 1.0
 
 
@@ -510,6 +674,7 @@ def render_assets_with_blender(
     hand_colors: Tuple[str, str] = ("blue1", "blue2"),
     object_color: str = "pink",
     render_camera: bool = False,
+    render_trail: bool = True,
 ) -> None:
     if bpy is None:
         raise RuntimeError(
@@ -560,43 +725,53 @@ def render_assets_with_blender(
     bpy.ops.render.render(write_still=True)
     LOGGER.info("Saved predicted camera render to %s", pred_output_path)
 
-    if blend_save_path:
-        blend_save_path = osp.abspath(blend_save_path)
-        os.makedirs(osp.dirname(blend_save_path), exist_ok=True)
-        LOGGER.info("Saving Blender scene to %s", blend_save_path)
-        bpy.ops.wm.save_as_mainfile(filepath=blend_save_path)
-
     LOGGER.info(
         "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
         allocentric_step,
         len(frame_assets),
     )
 
+    camera_positions: List[np.ndarray] = []
+    trail_points = {"left": [], "right": [], "camera": []}
+    for path in frame_assets:
+        frame_assets_full = _load_asset_bundle(path)
+        camera_info_full = frame_assets_full.get("camera")
+        if camera_info_full is not None:
+            wTc_full = np.asarray(camera_info_full.get("extrinsic_wTc"), dtype=np.float32)
+            cam_mat_full = pytorch3d_to_blender_camera(wTc_full)
+            cam_pos = cam_mat_full[:3, 3]
+            camera_positions.append(cam_pos)
+            if render_trail:
+                trail_points["camera"].append(cam_pos.tolist())
+        if render_trail:
+            for mesh_info in frame_assets_full["meshes"]:
+                verts = mesh_info.get("vertices")
+                if verts is None or len(verts) == 0:
+                    continue
+                name = mesh_info.get("name", "").lower()
+                if "left_hand" in name:
+                    trail_points["left"].append(verts[0])
+                elif "right_hand" in name:
+                    trail_points["right"].append(verts[0])
+
+    floor_center: Tuple[float, float, float] | None = None
+    if alloc_camera_info is not None:
+        alloc_wTc = np.asarray(alloc_camera_info.get("extrinsic_wTc"), dtype=np.float32)
+        alloc_mat = pytorch3d_to_blender_camera(alloc_wTc)
+        alloc_pos = alloc_mat[:3, 3]
+        floor_center = (
+            float(alloc_pos[0]),
+            float(alloc_pos[1]) + 1,
+            -1
+        )
+
     _clear_scene()
-    _setup_environment(scene, include_floor=True)
+    _setup_environment(scene, include_floor=True, floor_center=floor_center)
     _choose_render_engine(scene)
     _configure_eevee(scene)
     sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
     if sampled_indices[-1] != len(frame_assets) - 1:
         sampled_indices.append(len(frame_assets) - 1)
-
-    trail_points = {"left": [], "right": [], "camera": []}
-    for path in frame_assets:
-        frame_assets_full = _load_asset_bundle(path)
-        for mesh_info in frame_assets_full["meshes"]:
-            verts = mesh_info.get("vertices")
-            if verts is None or len(verts) == 0:
-                continue
-            name = mesh_info.get("name", "").lower()
-            if "left_hand" in name:
-                trail_points["left"].append(verts[0])
-            elif "right_hand" in name:
-                trail_points["right"].append(verts[0])
-        camera_info_full = frame_assets_full.get("camera")
-        if camera_info_full is not None:
-            wTc_full = np.asarray(camera_info_full.get("extrinsic_wTc"), dtype=np.float32)
-            cam_mat_full = pytorch3d_to_blender_camera(wTc_full)
-            trail_points["camera"].append(cam_mat_full[:3, 3].tolist())
 
 
     for order, idx in enumerate(sampled_indices):
@@ -621,32 +796,36 @@ def render_assets_with_blender(
                     size=0.05,
                 )
 
-    _create_trail(
-        "left_hand",
-        trail_points["left"],
-        COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
-        width=0.002,
-    )
-    _create_trail(
-        "right_hand",
-        trail_points["right"],
-        COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
-        width=0.002,
-    )
-    if render_camera:
+    if render_trail:
         _create_trail(
-            "predicted_camera",
-            trail_points["camera"],
-            COLOR_CHOICES["darkgray"],
-            width=0.0015,
+            "left_hand",
+            trail_points["left"],
+            COLOR_CHOICES[_HAND_COLOR_SELECTION[0]],
+            width=0.002,
         )
+        _create_trail(
+            "right_hand",
+            trail_points["right"],
+            COLOR_CHOICES[_HAND_COLOR_SELECTION[1]],
+            width=0.002,
+        )
+        if render_camera:
+            _create_trail(
+                "predicted_camera",
+                trail_points["camera"],
+                COLOR_CHOICES["darkgray"],
+                width=0.0015,
+            )
 
     scene = bpy.context.scene
     _choose_render_engine(scene)
     if alloc_camera_info is not None:
         cam_obj, _ = _configure_camera_from_assets(alloc_camera_info)
     else:
-        scene.render.resolution_x = 1920
+        # scene.render.resolution_x = 1920
+        # scene.render.resolution_y = 1080
+        # get a 4:3
+        scene.render.resolution_x = 1440
         scene.render.resolution_y = 1080
         scene.render.resolution_percentage = 100
         scene.render.film_transparent = True
@@ -663,6 +842,24 @@ def render_assets_with_blender(
     bpy.context.scene.render.filepath = allocentric_path
     bpy.ops.render.render(write_still=True)
     LOGGER.info("Saved allocentric overlay render to %s", allocentric_path)
+
+    if alloc_camera_info is not None:
+        export_camera = {}
+        for key, value in alloc_camera_info.items():
+            if isinstance(value, np.ndarray):
+                export_camera[key] = value.tolist()
+            else:
+                export_camera[key] = value
+        camera_export_path = osp.join(output_dir, "allocentric_camera.json")
+        with open(camera_export_path, "w", encoding="utf-8") as f:
+            json.dump(export_camera, f, indent=2)
+        LOGGER.info("Saved allocentric camera parameters to %s", camera_export_path)
+
+    if blend_save_path:
+        blend_save_path = osp.abspath(blend_save_path)
+        os.makedirs(osp.dirname(blend_save_path), exist_ok=True)
+        LOGGER.info("Saving Blender scene (with floor) to %s", blend_save_path)
+        bpy.ops.wm.save_as_mainfile(filepath=blend_save_path)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -751,6 +948,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="If set, draw allocentric camera wireframes for sampled frames.",
     )
+    parser.add_argument(
+        "--render-trail",
+        dest="render_trail",
+        action="store_true",
+        help="Draw hand and camera motion trails in the allocentric view.",
+    )
+    parser.add_argument(
+        "--no-render-trail",
+        dest="render_trail",
+        action="store_false",
+        help="Disable hand and camera motion trails.",
+    )
+    parser.set_defaults(render_trail=True)
     return parser.parse_args(argv)
 
 
@@ -784,6 +994,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             hand_colors=hand_colors,
             object_color=object_color,
             render_camera=args.render_camera,
+            render_trail=args.render_trail,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
