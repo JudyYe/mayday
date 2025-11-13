@@ -33,6 +33,7 @@ LOGGER = logging.getLogger("mayday.blender_wrapper")
 SAVE_ROOT = Path("outputs/blender_results")
 
 METHOD_TO_SOURCE = {
+    "teaser": "outputs/blender_results/teaser/{seq_obj}.pkl",
     "ours-gen": "outputs/org/ours/sample/{seq_obj}.pkl",
     "gt": "outputs/org/gt/{seq_obj}.pkl",
     "ours": "outputs/org/ours/post/{seq_obj}.pkl",
@@ -100,10 +101,14 @@ def _run_blender(
     hand_colors: str = DEFAULT_HAND_COLORS,
     target_frame: int = 0,
     allocentric_step: int = DEFAULT_ALLOCENTRIC_STEP,
+    allocentric_frames: Sequence[int] | None = None,
     render_allocentric: bool = True,
     render_target_frame: bool = True,
     render_camera: bool = False,
+    render_hand: bool = True,
+    render_obj_trail: bool = False,
     vis_contact: bool = False,
+    save_blend_path: Path | None = None,
 ) -> None:
     cmd = [
         str(blender_exe),
@@ -126,12 +131,19 @@ def _run_blender(
         "--object-color",
         object_color,
     ]
+    if allocentric_frames is not None:
+        frame_tokens = ",".join(str(int(idx)) for idx in allocentric_frames)
+        cmd.extend(["--allocentric-frames", frame_tokens])
     if render_camera:
         cmd.append("--render-camera")
     cmd.append("--render-allocentric" if render_allocentric else "--no-render-allocentric")
     cmd.append("--render-target-frame" if render_target_frame else "--no-render-target-frame")
     cmd.append("--vis-contact" if vis_contact else "--no-vis-contact")
-    LOGGER.info("Running Blender render: %s", " ".join(cmd))
+    cmd.append("--render-hand" if render_hand else "--no-render-hand")
+    cmd.append("--vis-obj-trail" if render_obj_trail else "--no-vis-obj-trail")
+    if save_blend_path is not None:
+        cmd.extend(["--save-blend", str(save_blend_path)])
+    print("Running Blender render: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
@@ -208,11 +220,6 @@ def _build_webpage(image_folder: str, method_columns: Sequence[str]) -> None:
     web_dir = WEB_ROOT / image_folder
     web_dir.mkdir(parents=True, exist_ok=True)
 
-    columns = ["input"] + list(method_columns)
-
-    # columns = ["input", "gt", "fp_simple", "fp_full", "ours"]
-    # method_columns = columns[1:]
-
     index = _index_web_images(image_folder, method_columns)
     seq_ids = sorted(index.keys())
 
@@ -274,6 +281,8 @@ def render_all_methods(
     allocentric_step: int = DEFAULT_ALLOCENTRIC_STEP,
     blender_exe: str | None = None,
     align_alloc: bool = False,
+    vis_obj_trail: bool = False,
+    render_hand_per_method: Sequence[int] | str | None = None,
     **kwargs,
 ) -> None:
     """Convert and render the specified methods for a sequence/object pair."""
@@ -291,9 +300,31 @@ def render_all_methods(
             "Set BLENDER_EXE or pass blender_exe explicitly."
         )
 
-    method_info: List[Tuple[str, Path, Path, str]] = []
+    method_info: List[Tuple[str, Path, Path, str, str, bool]] = []
 
-    for method in method_list:
+    base_render_hand = bool(kwargs.get("render_hand", True))
+    if render_hand_per_method is None:
+        method_hand_flags = [base_render_hand for _ in method_list]
+    else:
+        if isinstance(render_hand_per_method, str):
+            tokens = [token.strip() for token in render_hand_per_method.split(",") if token.strip()]
+            values = tokens
+        else:
+            values = list(render_hand_per_method)
+        if len(values) != len(method_list):
+            raise ValueError(
+                f"render_hand_per_method expects {len(method_list)} entries, got {len(values)}"
+            )
+        method_hand_flags = []
+        for value in values:
+            if isinstance(value, str):
+                if value not in {"0", "1"}:
+                    raise ValueError("render_hand_per_method entries must be '0' or '1'")
+                method_hand_flags.append(value == "1")
+            else:
+                method_hand_flags.append(bool(value))
+
+    for idx, method in enumerate(method_list):
         prediction_path = _resolve_prediction_path(method, seq_obj)
         color_entry = METHOD_TO_COLOR.get(method, "blue1")
         if isinstance(color_entry, tuple):
@@ -313,13 +344,13 @@ def render_all_methods(
                 "Run with cvt_bundle=True first."
             )
 
-        method_info.append((method, bundle_dir, image_dir, object_color))
+        method_info.append((method, bundle_dir, image_dir, object_color, hand_color_entry, method_hand_flags[idx]))
 
     shared_alloc = None
     if align_alloc:
         combined_vertices: List[np.ndarray] = []
         assets_map: Dict[Path, List[Path]] = {}
-        for _, bundle_dir, _, _ in method_info:
+        for _, bundle_dir, _, _, _, _ in method_info:
             scene_vertices, asset_paths = _gather_scene_vertices(bundle_dir)
             combined_vertices.extend(scene_vertices)
             assets_map[bundle_dir] = asset_paths
@@ -342,7 +373,7 @@ def render_all_methods(
     if render:
         web_dir = WEB_ROOT / image_folder
         web_dir.mkdir(parents=True, exist_ok=True)
-        for method, bundle_dir, image_dir, object_color in method_info:
+        for method, bundle_dir, image_dir, object_color, hand_color_entry, render_hand_flag in method_info:
             image_dir.mkdir(parents=True, exist_ok=True)
 
             # overlay_frame = frame_list[0]
@@ -357,6 +388,8 @@ def render_all_methods(
                 render_allocentric=True,
                 render_target_frame=False,
                 render_camera=kwargs.get("render_camera", False),
+                render_hand=render_hand_flag,
+                render_obj_trail=vis_obj_trail,
                 vis_contact=kwargs.get("vis_contact", False),
             )
             _rename_outputs(image_dir, seq_obj, method, web_dir)
@@ -373,6 +406,8 @@ def render_all_methods(
                     render_allocentric=False,
                     render_target_frame=True,
                     render_camera=kwargs.get("render_camera", False),
+                    render_hand=render_hand_flag,
+                    render_obj_trail=vis_obj_trail,
                     vis_contact=kwargs.get("vis_contact", False),
                 )
                 _rename_outputs(image_dir, seq_obj, method, web_dir)

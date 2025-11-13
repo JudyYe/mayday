@@ -38,6 +38,8 @@ DEFAULT_OBJECT_COLOR: str = "pink"
 _HAND_COLOR_SELECTION: Tuple[str, str] = DEFAULT_HAND_COLORS
 _OBJECT_COLOR_SELECTION: str = DEFAULT_OBJECT_COLOR
 _VIS_CONTACT: bool = False
+_RENDER_HAND: bool = True
+_RENDER_OBJ_TRAIL: bool = False
 
 
 def _validate_color_name(name: str) -> str:
@@ -207,7 +209,6 @@ hand_metallic = 0.05
 # hand_metallic = 0.1
 def _material_params(name: str) -> Tuple[float, float]:
     name_lower = name.lower()
-    print(name_lower)
     if "left" in name_lower or "right" in name_lower:
         return 0.55, hand_metallic
     if "object" in name_lower:
@@ -467,6 +468,7 @@ def _grid_floor_material(
 
 
 def _create_trail(name: str, points: List[Sequence[float]], color: Tuple[float, float, float], width: float = 0.01):
+    print("CREATE TRAIL?????", name)
     if bpy is None or len(points) < 2:
         return
     curve = bpy.data.curves.new(name=f"{name}_trail_curve", type="CURVE")
@@ -695,6 +697,7 @@ def render_assets_with_blender(
     output_dir: str,
     target_frame: int = 50,
     allocentric_step: int = 50,
+    allocentric_frames: Sequence[int] | None = None,
     external_camera_location: Tuple[float, float, float] = (1.5, -1.5, 1.0),
     external_camera_target: Tuple[float, float, float] = (0.0, 0.0, 0.3),
     blend_save_path: str | None = None,
@@ -704,6 +707,8 @@ def render_assets_with_blender(
     render_trail: bool = True,
     render_allocentric: bool = True,
     render_target_frame: bool = True,
+    render_hand: bool = True,
+    render_obj_trail: bool = False,
     vis_contact: bool = False,
 ) -> None:
     if bpy is None:
@@ -717,6 +722,9 @@ def render_assets_with_blender(
     _HAND_COLOR_SELECTION = hand_colors
     _OBJECT_COLOR_SELECTION = object_color
     _VIS_CONTACT = vis_contact
+    global _RENDER_HAND, _RENDER_OBJ_TRAIL
+    _RENDER_HAND = render_hand
+    _RENDER_OBJ_TRAIL = render_obj_trail
     asset_dir = osp.abspath(asset_dir)
     output_dir = osp.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -743,6 +751,8 @@ def render_assets_with_blender(
         _configure_eevee(scene)
 
         for mesh_info in frame_data["meshes"]:
+            if not _RENDER_HAND and "hand" in mesh_info.get("name", "").lower():
+                continue
             _build_mesh(_apply_contact_color(dict(mesh_info)))
         _configure_camera_from_assets(frame_data["camera"])
         input_frame = frame_data.get("image_path")
@@ -760,14 +770,38 @@ def render_assets_with_blender(
         LOGGER.info("Skipping predicted camera render (--no-render-target-frame specified).")
 
     if render_allocentric:
-        LOGGER.info(
-            "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
-            allocentric_step,
-            len(frame_assets),
-        )
+        if allocentric_frames is not None:
+            try:
+                sampled_indices = sorted(dict.fromkeys(int(idx) for idx in allocentric_frames))
+            except ValueError as exc:
+                raise ValueError("allocentric_frames must contain integer indices") from exc
+            if not sampled_indices:
+                raise ValueError("allocentric_frames provided but empty after parsing")
+            invalid = [idx for idx in sampled_indices if idx < 0 or idx >= len(frame_assets)]
+            if invalid:
+                raise ValueError(
+                    f"Allocentric frame indices out of range (total {len(frame_assets)}): {invalid}"
+                )
+            LOGGER.info(
+                "Rendering allocentric overlay using frames %s (total frames: %d)",
+                sampled_indices,
+                len(frame_assets),
+            )
+        else:
+            LOGGER.info(
+                "Rendering allocentric overlay sampling every %d frames (total frames: %d)",
+                allocentric_step,
+                len(frame_assets),
+            )
+            sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
+            if sampled_indices[-1] != len(frame_assets) - 1:
+                sampled_indices.append(len(frame_assets) - 1)
+
 
         camera_positions: List[np.ndarray] = []
         trail_points = {"left": [], "right": [], "camera": []}
+        obj_trail_points: Dict[str, List[List[float]]] = {}
+        obj_trail_colors: Dict[str, Tuple[float, float, float]] = {}
         for path in frame_assets:
             frame_assets_full = _load_asset_bundle(path)
             camera_info_full = frame_assets_full.get("camera")
@@ -778,16 +812,27 @@ def render_assets_with_blender(
                 camera_positions.append(cam_pos)
                 if render_trail:
                     trail_points["camera"].append(cam_pos.tolist())
-            if render_trail:
-                for mesh_info in frame_assets_full["meshes"]:
-                    verts = mesh_info.get("vertices")
-                    if verts is None or len(verts) == 0:
-                        continue
-                    name = mesh_info.get("name", "").lower()
+            for mesh_info in frame_assets_full["meshes"]:
+                verts = mesh_info.get("vertices")
+                if verts is None or len(verts) == 0:
+                    continue
+                name = mesh_info.get("name", "").lower()
+                if render_trail and _RENDER_HAND:
                     if "left_hand" in name:
                         trail_points["left"].append(verts[0])
-                    elif "right_hand" in name:
+                        continue
+                    if "right_hand" in name:
                         trail_points["right"].append(verts[0])
+                        continue
+                if _RENDER_OBJ_TRAIL and "object" in name:
+                    verts_np = np.asarray(verts, dtype=np.float32)
+                    if verts_np.ndim == 2 and verts_np.shape[1] == 3:
+                        center = verts_np.mean(axis=0)
+                        obj_name = mesh_info.get("name", "object")
+                        obj_trail_points.setdefault(obj_name, []).append(center.tolist())
+                        color = mesh_info.get("color")
+                        if color is not None and len(color) >= 3:
+                            obj_trail_colors[obj_name] = tuple(float(c) for c in color[:3])
 
         floor_center: Tuple[float, float, float] | None = None
         if alloc_camera_info is not None:
@@ -804,15 +849,14 @@ def render_assets_with_blender(
         _setup_environment(scene, include_floor=True, floor_center=floor_center)
         _choose_render_engine(scene)
         _configure_eevee(scene)
-        sampled_indices = list(range(0, len(frame_assets), max(allocentric_step, 1)))
-        if sampled_indices[-1] != len(frame_assets) - 1:
-            sampled_indices.append(len(frame_assets) - 1)
 
 
         for order, idx in enumerate(sampled_indices):
             assets = _load_asset_bundle(frame_assets[idx])
             frame_factor = idx / max(len(frame_assets) - 1, 1)
             for mesh_info in assets["meshes"]:
+                if not _RENDER_HAND and "hand" in mesh_info.get("name", "").lower():
+                    continue
                 mesh_info = _apply_contact_color(dict(mesh_info))
                 mesh_info["name"] = f"{mesh_info['name']}_t{idx:04d}"
                 base_color = np.array(mesh_info.get("color", [0.8, 0.8, 0.8, 1.0]), dtype=np.float32)
@@ -834,7 +878,7 @@ def render_assets_with_blender(
                         size=0.05,
                     )
 
-        if render_trail:
+        if render_trail and _RENDER_HAND:
             _create_trail(
                 "left_hand",
                 trail_points["left"],
@@ -853,6 +897,17 @@ def render_assets_with_blender(
                     trail_points["camera"],
                     COLOR_CHOICES["darkgray"],
                     width=0.0015,
+                )
+        if _RENDER_OBJ_TRAIL:
+            for obj_name, points in obj_trail_points.items():
+                if len(points) < 2:
+                    continue
+                color = obj_trail_colors.get(obj_name, COLOR_CHOICES[_OBJECT_COLOR_SELECTION])
+                _create_trail(
+                    obj_name,
+                    points,
+                    color,
+                    width=0.0025,
                 )
 
         scene = bpy.context.scene
@@ -953,6 +1008,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Stride when sampling frames for the allocentric overlay.",
     )
     parser.add_argument(
+        "--allocentric-frames",
+        help="Comma-separated list of frame indices to render for the allocentric overlay.",
+    )
+    parser.add_argument(
         "--external-camera-location",
         nargs=3,
         type=float,
@@ -1025,6 +1084,30 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Disable predicted camera rendering for the target frame.",
     )
     parser.add_argument(
+        "--render-hand",
+        dest="render_hand",
+        action="store_true",
+        help="Render hand meshes.",
+    )
+    parser.add_argument(
+        "--no-render-hand",
+        dest="render_hand",
+        action="store_false",
+        help="Skip rendering hand meshes.",
+    )
+    parser.add_argument(
+        "--vis-obj-trail",
+        dest="render_obj_trail",
+        action="store_true",
+        help="Visualize object center-of-mass trails.",
+    )
+    parser.add_argument(
+        "--no-vis-obj-trail",
+        dest="render_obj_trail",
+        action="store_false",
+        help="Disable object center-of-mass trails.",
+    )
+    parser.add_argument(
         "--vis-contact",
         dest="vis_contact",
         action="store_true",
@@ -1040,6 +1123,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         render_trail=True,
         render_allocentric=True,
         render_target_frame=True,
+        render_hand=True,
+        render_obj_trail=False,
         vis_contact=False,
     )
     return parser.parse_args(argv)
@@ -1064,11 +1149,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             object_color = _validate_color_name(args.object_color)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+
+        allocentric_frames: List[int] | None = None
+        if args.allocentric_frames:
+            tokens = [token.strip() for token in args.allocentric_frames.split(",") if token.strip()]
+            if not tokens:
+                raise SystemExit("--allocentric-frames provided but empty")
+            try:
+                allocentric_frames = [int(token) for token in tokens]
+            except ValueError as exc:
+                raise SystemExit("--allocentric-frames must contain integers") from exc
+
         render_assets_with_blender(
             asset_dir=args.asset_dir,
             output_dir=args.output_dir,
             target_frame=args.target_frame,
             allocentric_step=args.allocentric_step,
+            allocentric_frames=allocentric_frames,
             external_camera_location=tuple(args.external_camera_location),
             external_camera_target=tuple(args.external_camera_target),
             blend_save_path=args.save_blend,
@@ -1078,6 +1175,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             render_trail=args.render_trail,
             render_allocentric=args.render_allocentric,
             render_target_frame=args.render_target_frame,
+            render_hand=args.render_hand,
+            render_obj_trail=args.render_obj_trail,
             vis_contact=args.vis_contact,
         )
     else:
