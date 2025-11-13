@@ -49,6 +49,9 @@ METHOD_TO_COLOR = {
     "fp_full": "pink",
     "ours": "blue1",
 }
+for i in range(5):
+    METHOD_TO_SOURCE["ours-gen-%d" % i] = "outputs/org/ours-gen/sample_%d/{seq_obj}.pkl" % i
+    METHOD_TO_COLOR["ours-gen-%d" % i] = "blue1"
 
 DEFAULT_HAND_COLORS = "blue1,blue2"
 # DEFAULT_TARGET_FRAME = 50
@@ -292,7 +295,7 @@ def render_all_methods(
 
     for method in method_list:
         prediction_path = _resolve_prediction_path(method, seq_obj)
-        color_entry = METHOD_TO_COLOR.get(method, "pink")
+        color_entry = METHOD_TO_COLOR.get(method, "blue1")
         if isinstance(color_entry, tuple):
             hand_color_entry, object_color = color_entry
         else:
@@ -409,6 +412,7 @@ def main(
             )
 
     rebuild_web_gallery(image_folder, method_list)
+
 
 
 if __name__ == "__main__":

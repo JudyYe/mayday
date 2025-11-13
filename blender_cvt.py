@@ -378,8 +378,13 @@ def convert_pkl_to_asset_list(
         )
         scene_vertices.append(wTc[:, :3, 3])
 
+        print(pkl_dir, osp.isdir(pkl_dir))
+        if osp.isdir(pkl_dir):
+            seq_output_dir = osp.join(output_dir, str(index))
+        else:
+            seq_output_dir = output_dir
+
         # seq_output_dir = osp.join(output_dir, str(index))
-        seq_output_dir = output_dir
         os.makedirs(seq_output_dir, exist_ok=True)
 
         width = int(round(float(intr[0, 2]) * 2))
@@ -551,8 +556,6 @@ def main(mode, **kwargs):
         convert_pkl_to_asset_list(**kwargs)
     elif mode == "cvt_gt":
         covnert_gt_to_pkl(**kwargs)
-    elif mode == "compare":
-        make_one_web_page_compare(**kwargs)
     else:
         raise ValueError(f"Invalid mode: {mode}")
 

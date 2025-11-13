@@ -203,10 +203,13 @@ def _mesh_color_palette(name: str, base_color: Iterable[float]) -> Tuple[float, 
     return tuple(float(c) for c in base_color[:3])
 
 
+hand_metallic = 0.05
+# hand_metallic = 0.1
 def _material_params(name: str) -> Tuple[float, float]:
     name_lower = name.lower()
+    print(name_lower)
     if "left" in name_lower or "right" in name_lower:
-        return 0.55, 0.05
+        return 0.55, hand_metallic
     if "object" in name_lower:
         return 0.35, 0.0
     return 0.6, 0.0
@@ -235,6 +238,7 @@ def _build_mesh(mesh_info: Dict, stylized: bool = True):
     mesh_obj = bpy.data.objects.new(name, mesh_data)
     bpy.context.collection.objects.link(mesh_obj)
 
+    metallic = 0.
     force_color = bool(mesh_info.get("force_color"))
     if stylized and not force_color:
         palette_color = _mesh_color_palette(name, color)
@@ -242,7 +246,7 @@ def _build_mesh(mesh_info: Dict, stylized: bool = True):
         _assign_material(mesh_obj, palette_color, roughness=roughness, metallic=metallic, alpha=alpha)
     else:
         force_palette = tuple(color[:3]) if len(color) >= 3 else (0.8, 0.8, 0.8)
-        _assign_material(mesh_obj, force_palette, roughness=0.3, metallic=0.0, alpha=alpha)
+        _assign_material(mesh_obj, force_palette, roughness=0.3, metallic=metallic, alpha=alpha)
     return mesh_obj
 
 
