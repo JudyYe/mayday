@@ -335,9 +335,10 @@ def _configure_camera_from_assets(camera_assets: Dict) -> Tuple[object, object]:
     scene = bpy.context.scene
     _choose_render_engine(scene)
     scene.camera = cam_obj
-    scene.render.resolution_x = width
-    scene.render.resolution_y = height
-    scene.render.resolution_percentage = 100
+    # Note: Resolution is set by the caller to allow override
+    # scene.render.resolution_x = width
+    # scene.render.resolution_y = height
+    # scene.render.resolution_percentage = 100
     scene.render.film_transparent = True
     return cam_obj, cam_data
 
@@ -530,6 +531,7 @@ def _setup_environment(
     scene,
     include_floor: bool = True,
     floor_center: Tuple[float, float, float] | None = None,
+    floor_size: float = 2.5,
 ):
     # FLOOR: z= -1
     if bpy is None:
@@ -552,8 +554,8 @@ def _setup_environment(
         else:
             floor_x, floor_y, floor_z = 0.0, 0.0, -1.0
 
-        # Floor plane - larger and properly scaled
-        bpy.ops.mesh.primitive_plane_add(size=2.5, scale=(0.5, 1., 1.))  # wide table
+        # Floor plane - size based on dynamic_floor flag
+        bpy.ops.mesh.primitive_plane_add(size=floor_size, scale=(0.5, 1., 1.))  # wide table
         floor = bpy.context.object
         floor.name = "Floor"
         
@@ -575,49 +577,9 @@ def _setup_environment(
         
         floor.location = (floor_x, floor_y, floor_z)
 
-    # # Ambient light
-    # scene.world.use_nodes = True
-    # bg = scene.world.node_tree.nodes["Background"]
-    # bg.inputs["Color"].default_value = (0.70, 0.70, 0.72, 1.0)
-    # bg.inputs["Strength"].default_value = 0.2
-
-    # if include_floor:
-    #     # Floor plane
-    #     bpy.ops.mesh.primitive_plane_add(size=60)
-    #     floor = bpy.context.object
-    #     floor.name = "Floor"
-    #     grid_material = _grid_floor_material()
-    #     if grid_material:
-    #         if floor.data.materials:
-    #             floor.data.materials[0] = grid_material
-    #         else:
-    #             floor.data.materials.append(grid_material)
-    #     else:
-    #         _assign_material(floor, (0.96, 0.96, 0.96), roughness=0.85)
-    #     floor.location = (0.0, 0.0, -1)
-
-    #     # Backdrop wall
-    #     bpy.ops.mesh.primitive_plane_add(size=60)
-    #     wall = bpy.context.object
-    #     wall.name = "Backdrop"
-    #     wall.rotation_euler = (1.5708, 0.0, 0.0)
-    #     wall.location = (0.0, -30.0, 30.0)
-    #     _assign_material(wall, (0.78, 0.78, 0.80), roughness=0.9)
-
-    # Key light
-    # key_data = bpy.data.lights.new("KeyLight", type="AREA")
-    # key_data.energy = 1200
-    # key_data.color = (1.0, 0.92, 0.82)
-    # key_data.size = 7
-    # key = bpy.data.objects.new("KeyLight", key_data)
-    # key.location = (6.0, -6.0, 8.0)
-    # key.rotation_euler = (1.1, 0.0, 0.8)
-    # bpy.context.collection.objects.link(key)
-
-
     # Main directional key light for sharp shadows - pointing downward
     key_data = bpy.data.lights.new("KeyLight", type="SUN")  # SUN for sharp parallel shadows
-    key_data.energy = 1.6  # Reduce brightness
+    key_data.energy = 3  # Reduce brightness
     key_data.angle = 0.03  # Slightly softer shadows
     key = bpy.data.objects.new("KeyLight", key_data)
     key.location = (5.0, -5.0, 10.0)  # Position above the scene
@@ -666,10 +628,17 @@ def _setup_environment(
     bpy.context.collection.objects.link(top)
 
 
-def _configure_eevee(scene):
+def _configure_eevee(scene, render_samples: int = 64):
     eevee = getattr(scene, "eevee", None)
     if eevee is None:
         return
+    # Configure TAA (Temporal Anti-Aliasing) samples for faster rendering
+    # Lower samples = faster rendering, higher samples = better quality
+    if hasattr(eevee, "taa_render_samples"):
+        eevee.taa_render_samples = render_samples
+    # For Eevee Next (4.0+), use sample_count
+    if hasattr(eevee, "sample_count"):
+        eevee.sample_count = render_samples
     if hasattr(eevee, "use_soft_shadows"):
         eevee.use_soft_shadows = True
     if hasattr(eevee, "use_gtao"):
@@ -710,6 +679,13 @@ def render_assets_with_blender(
     render_hand: bool = True,
     render_obj_trail: bool = False,
     vis_contact: bool = False,
+    render_video: bool = False,
+    video_frame_idx: int | None = None,
+    render_width: int = 1440,
+    render_height: int = 1080,
+    render_cam_h: int | None = None,
+    render_samples: int = 64,
+    dynamic_floor: bool = False,
 ) -> None:
     if bpy is None:
         raise RuntimeError(
@@ -735,6 +711,13 @@ def render_assets_with_blender(
 
     scene = bpy.context.scene
 
+    # For video mode, limit frame_assets to only the current frame
+    if render_video and video_frame_idx is not None:
+        # Only include the current frame for trails (single frame rendering)
+        frame_assets_for_trails = [frame_assets[video_frame_idx]] if video_frame_idx < len(frame_assets) else []
+    else:
+        frame_assets_for_trails = frame_assets
+
     target_idx = min(target_frame, len(frame_assets) - 1)
     frame_data = _load_asset_bundle(frame_assets[target_idx])
     alloc_camera_info = frame_data.get("alloc_camera")
@@ -748,17 +731,29 @@ def render_assets_with_blender(
         _clear_scene()
         _setup_environment(scene, include_floor=False)
         _choose_render_engine(scene)
-        _configure_eevee(scene)
+        _configure_eevee(scene, render_samples=render_samples)
 
         for mesh_info in frame_data["meshes"]:
             if not _RENDER_HAND and "hand" in mesh_info.get("name", "").lower():
                 continue
             _build_mesh(_apply_contact_color(dict(mesh_info)))
         _configure_camera_from_assets(frame_data["camera"])
+        
+        # Set render resolution for camera view: square (HxH)
+        # Use render_cam_h if provided, otherwise use render_height
+        camera_resolution = render_cam_h if render_cam_h is not None else render_height
+        scene.render.resolution_x = camera_resolution
+        scene.render.resolution_y = camera_resolution
+        scene.render.resolution_percentage = 100
+        LOGGER.info("Set camera view resolution to %dx%d (square)", camera_resolution, camera_resolution)
+        
         input_frame = frame_data.get("image_path")
         if input_frame and osp.exists(input_frame):
             try:
-                Image.open(input_frame).save(osp.join(output_dir, f"{target_idx:04d}_input.png"))
+                input_img = Image.open(input_frame)
+                # Resize input image to match camera render resolution (square)
+                input_img_resized = input_img.resize((camera_resolution, camera_resolution), Image.Resampling.LANCZOS)
+                input_img_resized.save(osp.join(output_dir, f"{target_idx:04d}_input.png"))
             except Exception as exc:
                 LOGGER.warning("Failed to save input frame %s: %s", input_frame, exc)
 
@@ -802,7 +797,7 @@ def render_assets_with_blender(
         trail_points = {"left": [], "right": [], "camera": []}
         obj_trail_points: Dict[str, List[List[float]]] = {}
         obj_trail_colors: Dict[str, Tuple[float, float, float]] = {}
-        for path in frame_assets:
+        for path in frame_assets_for_trails:
             frame_assets_full = _load_asset_bundle(path)
             camera_info_full = frame_assets_full.get("camera")
             if camera_info_full is not None:
@@ -839,16 +834,32 @@ def render_assets_with_blender(
             alloc_wTc = np.asarray(alloc_camera_info.get("extrinsic_wTc"), dtype=np.float32)
             alloc_mat = pytorch3d_to_blender_camera(alloc_wTc)
             alloc_pos = alloc_mat[:3, 3]
+            
+            # Floor Z position:
+            # - Default: Always use z=-1 (ignore any floor_z in alloc_camera_info)
+            # - With --dynamic_floor: Use floor_z from allocentric camera if available, otherwise -1
+            if dynamic_floor:
+                floor_z = alloc_camera_info.get("floor_z")
+                if floor_z is not None:
+                    floor_z_value = float(floor_z)
+                else:
+                    floor_z_value = -1.0
+            else:
+                # Default behavior: always use z=-1
+                floor_z_value = -1.0
+            
             floor_center = (
                 float(alloc_pos[0]),
                 float(alloc_pos[1]) + 1,
-                -1
+                floor_z_value
             )
 
         _clear_scene()
-        _setup_environment(scene, include_floor=True, floor_center=floor_center)
+        # Floor size: 5.0 if dynamic_floor, 2.5 otherwise
+        floor_size = 4.0 if dynamic_floor else 2.5
+        _setup_environment(scene, include_floor=True, floor_center=floor_center, floor_size=floor_size)
         _choose_render_engine(scene)
-        _configure_eevee(scene)
+        _configure_eevee(scene, render_samples=render_samples)
 
 
         for order, idx in enumerate(sampled_indices):
@@ -912,17 +923,10 @@ def render_assets_with_blender(
 
         scene = bpy.context.scene
         _choose_render_engine(scene)
+        
         if alloc_camera_info is not None:
             cam_obj, _ = _configure_camera_from_assets(alloc_camera_info)
         else:
-            # scene.render.resolution_x = 1920
-            # scene.render.resolution_y = 1080
-            # get a 4:3
-            scene.render.resolution_x = 1440
-            scene.render.resolution_y = 1080
-            scene.render.resolution_percentage = 100
-            scene.render.film_transparent = True
-
             alloc_cam_data = bpy.data.cameras.new("AllocentricCamera")
             alloc_cam_obj = bpy.data.objects.new("AllocentricCamera", alloc_cam_data)
             bpy.context.collection.objects.link(alloc_cam_obj)
@@ -931,7 +935,17 @@ def render_assets_with_blender(
             alloc_cam_data.lens = 35.0
             scene.camera = alloc_cam_obj
 
-        allocentric_path = osp.join(output_dir, "allocentric_overlay.png")
+        # Set render resolution (after camera configuration, to override any camera-based resolution)
+        scene.render.resolution_x = render_width
+        scene.render.resolution_y = render_height
+        scene.render.resolution_percentage = 100
+        scene.render.film_transparent = True
+        LOGGER.info("Set allocentric view resolution to %dx%d", render_width, render_height)
+
+        if render_video and video_frame_idx is not None:
+            allocentric_path = osp.join(output_dir, f"{video_frame_idx:04d}_allocentric_overlay.png")
+        else:
+            allocentric_path = osp.join(output_dir, "allocentric_overlay.png")
         bpy.context.scene.render.filepath = allocentric_path
         bpy.ops.render.render(write_still=True)
         LOGGER.info("Saved allocentric overlay render to %s", allocentric_path)
@@ -1096,6 +1110,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Skip rendering hand meshes.",
     )
     parser.add_argument(
+        "--no-hand",
+        dest="render_hand",
+        action="store_false",
+        help="Skip rendering hand meshes (alias for --no-render-hand). Bundles are still saved with hand data.",
+    )
+    parser.add_argument(
         "--vis-obj-trail",
         dest="render_obj_trail",
         action="store_true",
@@ -1119,6 +1139,48 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_false",
         help="Disable contact highlighting.",
     )
+    parser.add_argument(
+        "--render-video",
+        dest="render_video",
+        action="store_true",
+        help="Enable video rendering mode (saves per-frame outputs with frame indices).",
+    )
+    parser.add_argument(
+        "--video-frame-idx",
+        type=int,
+        default=None,
+        help="Frame index for video rendering (used to name output files).",
+    )
+    parser.add_argument(
+        "--render-width",
+        type=int,
+        default=1440,
+        help="Render width in pixels (default: 1440).",
+    )
+    parser.add_argument(
+        "--render-height",
+        type=int,
+        default=1080,
+        help="Render height in pixels (default: 1080).",
+    )
+    parser.add_argument(
+        "--render-cam-h",
+        type=int,
+        default=None,
+        help="Render height/width for camera view (square, HxH). If not specified, uses render-height.",
+    )
+    parser.add_argument(
+        "--render-samples",
+        type=int,
+        default=64,
+        help="Number of render samples for Eevee (TAA). Lower = faster, higher = better quality. Default: 64.",
+    )
+    parser.add_argument(
+        "--dynamic-floor",
+        dest="dynamic_floor",
+        action="store_true",
+        help="Use dynamic floor position (min_z - 0.05) and larger floor size (5.0).",
+    )
     parser.set_defaults(
         render_trail=True,
         render_allocentric=True,
@@ -1126,6 +1188,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         render_hand=True,
         render_obj_trail=False,
         vis_contact=False,
+        render_video=False,
+        video_frame_idx=None,
     )
     return parser.parse_args(argv)
 
@@ -1178,6 +1242,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             render_hand=args.render_hand,
             render_obj_trail=args.render_obj_trail,
             vis_contact=args.vis_contact,
+            render_video=args.render_video,
+            video_frame_idx=args.video_frame_idx,
+            render_width=args.render_width,
+            render_height=args.render_height,
+            render_cam_h=args.render_cam_h,
+            render_samples=args.render_samples,
+            dynamic_floor=args.dynamic_floor,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")

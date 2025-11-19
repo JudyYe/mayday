@@ -229,6 +229,154 @@ def compute_allocentric_camera(wTc_mats: List[np.ndarray]) -> Dict[str, np.ndarr
     }
 
 
+def convert_npz_to_asset_list(
+    npz_dir: str,
+    output_dir: str,
+    object_mesh_dir: str = "data/HOT3D-CLIP/object_models_eval/",
+    dataset_contact_path: str = "data/HOT3D-CLIP/preprocess/dataset_contact.pkl",
+) -> None:
+    _ensure_logger()
+
+    npz_dir = osp.abspath(npz_dir)
+    output_dir = osp.abspath(output_dir)
+    object_mesh_dir = osp.abspath(object_mesh_dir)
+    dataset_contact_path = osp.abspath(dataset_contact_path)
+
+    if osp.isdir(npz_dir):
+        npz_list = sorted(glob(osp.join(npz_dir, "*.npz")))
+    else:
+        assert osp.isfile(npz_dir), f"File {npz_dir} not found"
+        npz_list = [npz_dir]
+
+    LOGGER.info("Loading dataset contact metadata from %s", dataset_contact_path)
+    contact_meta = _load_dataset_contact(dataset_contact_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    LOGGER.info("Loading object mesh library from %s", object_mesh_dir)
+    object_library = Pt3dVisualizer.setup_template(
+        object_mesh_dir, lib="hotclip", load_mesh=True
+    )
+
+    IMAGE_ROOT = "/move/u/yufeiy2/egorecon/data/HOT3D-CLIP/extract_images-rot90"
+
+    camera_mats = []
+    asset_paths = []
+    scene_vertices: List[np.ndarray] = []
+
+    for npz_file in npz_list:
+        npz_data = np.load(npz_file, allow_pickle=True)
+        npz_dict = dict(npz_data)
+
+        index = osp.splitext(osp.basename(npz_file))[0]
+        seq_id, object_id = _resolve_ids(index, npz_file)
+
+        meta = contact_meta[seq_id]
+        intr = meta["intrinsic"]
+        wTc_gt = np.asarray(meta["wTc"], dtype=np.float32)
+
+        object_id_key = object_id
+
+        # Get wTo from npz
+        wTo_raw = np.asarray(npz_dict["wTo"], dtype=np.float32).squeeze(0)
+
+        # Convert wTo to matrices if needed
+        if wTo_raw.shape[-1] == 9:
+            wTo_mats = _pose9_to_matrix(wTo_raw)
+        elif wTo_raw.shape[-1] == 16 and len(wTo_raw.shape) == 2:
+            # Already in matrix form (T, 16) - reshape to (T, 4, 4)
+            wTo_mats = wTo_raw.reshape(-1, 4, 4)
+        elif len(wTo_raw.shape) == 3 and wTo_raw.shape[-2:] == (4, 4):
+            # Already in matrix form (T, 4, 4)
+            wTo_mats = wTo_raw
+        else:
+            raise ValueError(f"Unexpected wTo shape: {wTo_raw.shape}")
+
+        frame_count = wTo_mats.shape[0]
+        wTo_mats = wTo_mats.astype(np.float32)
+
+        # wTo is already aligned, so no wTwp transformation needed
+        wTo_aligned = torch.as_tensor(wTo_mats, dtype=torch.float32)
+        wTc = torch.as_tensor(wTc_gt, dtype=torch.float32)
+        camera_mats.extend([mat.astype(np.float32) for mat in wTc_gt])
+
+        # Create object mesh only
+        object_mesh = object_library[object_id_key]
+        obj_verts_exp = object_mesh.verts_padded().repeat(frame_count, 1, 1).to(
+            wTo_aligned.device
+        )
+        obj_faces = object_mesh.faces_padded()[0].cpu().numpy().astype(np.int32)
+        obj_world = mesh_utils.apply_transform(obj_verts_exp, wTo_aligned)
+
+        obj_world = obj_world.cpu().numpy().astype(np.float32)
+        wTc = wTc.cpu().numpy().astype(np.float32)
+
+        scene_vertices.append(obj_world.reshape(-1, 3))
+        scene_vertices.append(wTc[:, :3, 3])
+
+        if osp.isdir(npz_dir):
+            seq_output_dir = osp.join(output_dir, str(index))
+        else:
+            seq_output_dir = output_dir
+
+        os.makedirs(seq_output_dir, exist_ok=True)
+
+        width = int(round(float(intr[0, 2]) * 2))
+        height = int(round(float(intr[1, 2]) * 2))
+
+        for t in range(frame_count):
+            object_color = [0.85, 0.85, 0.85, 1.0]
+
+            image_path = osp.join(
+                IMAGE_ROOT,
+                f"clip-{seq_id}",
+                f"{t:04d}.jpg",
+            )
+
+            asset_bundle = {
+                "frame": int(t),
+                "seq_id": seq_id,
+                "object_id": object_id,
+                "prediction_index": index,
+                "camera": {
+                    "intrinsic": intr.astype(np.float32),
+                    "extrinsic_wTc": wTc[t].astype(np.float32),
+                    "width": width,
+                    "height": height,
+                },
+                "meshes": [
+                    {
+                        "name": "object",
+                        "vertices": obj_world[t],
+                        "faces": obj_faces,
+                        "color": object_color,
+                    },
+                ],
+            }
+            assert osp.exists(image_path), image_path
+            asset_bundle["image_path"] = image_path
+
+            asset_path = osp.join(seq_output_dir, f"{t:04d}.pkl")
+            with open(asset_path, "wb") as f:
+                pickle.dump(asset_bundle, f)
+            asset_paths.append(asset_path)
+
+        LOGGER.info(
+            "Converted %s -> %s (%d frames)",
+            osp.basename(npz_file),
+            seq_output_dir,
+            frame_count,
+        )
+
+    alloc_camera = compute_allocentric_camera_from_assets(scene_vertices)
+    alloc_camera["center"] = alloc_camera["center"].tolist()
+    for asset_path in asset_paths:
+        with open(asset_path, "rb") as f:
+            bundle = pickle.load(f)
+        bundle["alloc_camera"] = alloc_camera
+        with open(asset_path, "wb") as f:
+            pickle.dump(bundle, f)
+
+
 def convert_pkl_to_asset_list(
     pkl_dir: str,
     output_dir: str,
@@ -554,6 +702,8 @@ def covnert_gt_to_pkl(
 def main(mode, **kwargs):
     if mode == "convert":
         convert_pkl_to_asset_list(**kwargs)
+    elif mode == "convert_npz":
+        convert_npz_to_asset_list(**kwargs)
     elif mode == "cvt_gt":
         covnert_gt_to_pkl(**kwargs)
     else:
