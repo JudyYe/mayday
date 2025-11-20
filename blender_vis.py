@@ -39,6 +39,7 @@ _HAND_COLOR_SELECTION: Tuple[str, str] = DEFAULT_HAND_COLORS
 _OBJECT_COLOR_SELECTION: str = DEFAULT_OBJECT_COLOR
 _VIS_CONTACT: bool = False
 _RENDER_HAND: bool = True
+_RENDER_OBJ: bool = True
 _RENDER_OBJ_TRAIL: bool = False
 
 
@@ -677,6 +678,7 @@ def render_assets_with_blender(
     render_allocentric: bool = True,
     render_target_frame: bool = True,
     render_hand: bool = True,
+    render_obj: bool = True,
     render_obj_trail: bool = False,
     vis_contact: bool = False,
     render_video: bool = False,
@@ -698,8 +700,9 @@ def render_assets_with_blender(
     _HAND_COLOR_SELECTION = hand_colors
     _OBJECT_COLOR_SELECTION = object_color
     _VIS_CONTACT = vis_contact
-    global _RENDER_HAND, _RENDER_OBJ_TRAIL
+    global _RENDER_HAND, _RENDER_OBJ, _RENDER_OBJ_TRAIL
     _RENDER_HAND = render_hand
+    _RENDER_OBJ = render_obj
     _RENDER_OBJ_TRAIL = render_obj_trail
     asset_dir = osp.abspath(asset_dir)
     output_dir = osp.abspath(output_dir)
@@ -735,6 +738,8 @@ def render_assets_with_blender(
 
         for mesh_info in frame_data["meshes"]:
             if not _RENDER_HAND and "hand" in mesh_info.get("name", "").lower():
+                continue
+            if not _RENDER_OBJ and "object" in mesh_info.get("name", "").lower():
                 continue
             _build_mesh(_apply_contact_color(dict(mesh_info)))
         _configure_camera_from_assets(frame_data["camera"])
@@ -867,6 +872,8 @@ def render_assets_with_blender(
             frame_factor = idx / max(len(frame_assets) - 1, 1)
             for mesh_info in assets["meshes"]:
                 if not _RENDER_HAND and "hand" in mesh_info.get("name", "").lower():
+                    continue
+                if not _RENDER_OBJ and "object" in mesh_info.get("name", "").lower():
                     continue
                 mesh_info = _apply_contact_color(dict(mesh_info))
                 mesh_info["name"] = f"{mesh_info['name']}_t{idx:04d}"
@@ -1116,6 +1123,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Skip rendering hand meshes (alias for --no-render-hand). Bundles are still saved with hand data.",
     )
     parser.add_argument(
+        "--render-obj",
+        dest="render_obj",
+        action="store_true",
+        help="Render object meshes.",
+    )
+    parser.add_argument(
+        "--no-render-obj",
+        dest="render_obj",
+        action="store_false",
+        help="Skip rendering object meshes.",
+    )
+    parser.add_argument(
+        "--no-obj",
+        dest="render_obj",
+        action="store_false",
+        help="Skip rendering object meshes (alias for --no-render-obj). Bundles are still saved with object data.",
+    )
+    parser.add_argument(
         "--vis-obj-trail",
         dest="render_obj_trail",
         action="store_true",
@@ -1186,6 +1211,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         render_allocentric=True,
         render_target_frame=True,
         render_hand=True,
+        render_obj=True,
         render_obj_trail=False,
         vis_contact=False,
         render_video=False,
@@ -1240,6 +1266,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             render_allocentric=args.render_allocentric,
             render_target_frame=args.render_target_frame,
             render_hand=args.render_hand,
+            render_obj=args.render_obj,
             render_obj_trail=args.render_obj_trail,
             vis_contact=args.vis_contact,
             render_video=args.render_video,

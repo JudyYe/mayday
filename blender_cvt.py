@@ -276,41 +276,55 @@ def convert_npz_to_asset_list(
 
         object_id_key = object_id
 
-        # Get wTo from npz
-        wTo_raw = np.asarray(npz_dict["wTo"], dtype=np.float32).squeeze(0)
+        # Get wTo from npz (optional - may not exist in some files)
+        wTo_raw = npz_dict.get("wTo")
+        if wTo_raw is not None:
+            wTo_raw = np.asarray(wTo_raw, dtype=np.float32).squeeze(0)
 
-        # Convert wTo to matrices if needed
-        if wTo_raw.shape[-1] == 9:
-            wTo_mats = _pose9_to_matrix(wTo_raw)
-        elif wTo_raw.shape[-1] == 16 and len(wTo_raw.shape) == 2:
-            # Already in matrix form (T, 16) - reshape to (T, 4, 4)
-            wTo_mats = wTo_raw.reshape(-1, 4, 4)
-        elif len(wTo_raw.shape) == 3 and wTo_raw.shape[-2:] == (4, 4):
-            # Already in matrix form (T, 4, 4)
-            wTo_mats = wTo_raw
+            # Convert wTo to matrices if needed
+            if wTo_raw.shape[-1] == 9:
+                wTo_mats = _pose9_to_matrix(wTo_raw)
+            elif wTo_raw.shape[-1] == 16 and len(wTo_raw.shape) == 2:
+                # Already in matrix form (T, 16) - reshape to (T, 4, 4)
+                wTo_mats = wTo_raw.reshape(-1, 4, 4)
+            elif len(wTo_raw.shape) == 3 and wTo_raw.shape[-2:] == (4, 4):
+                # Already in matrix form (T, 4, 4)
+                wTo_mats = wTo_raw
+            else:
+                raise ValueError(f"Unexpected wTo shape: {wTo_raw.shape}")
+
+            frame_count = wTo_mats.shape[0]
+            wTo_mats = wTo_mats.astype(np.float32)
+
+            # wTo is already aligned, so no wTwp transformation needed
+            wTo_aligned = torch.as_tensor(wTo_mats, dtype=torch.float32)
+            
+            # Create object mesh only
+            object_mesh = object_library[object_id_key]
+            obj_verts_exp = object_mesh.verts_padded().repeat(frame_count, 1, 1).to(
+                wTo_aligned.device
+            )
+            obj_faces = object_mesh.faces_padded()[0].cpu().numpy().astype(np.int32)
+            obj_world = mesh_utils.apply_transform(obj_verts_exp, wTo_aligned)
+
+            obj_world = obj_world.cpu().numpy().astype(np.float32)
+            scene_vertices.append(obj_world.reshape(-1, 3))
         else:
-            raise ValueError(f"Unexpected wTo shape: {wTo_raw.shape}")
+            # If wTo is missing, determine frame_count from wTc_gt
+            if isinstance(wTc_gt, (list, tuple)):
+                frame_count = len(wTc_gt)
+            elif len(wTc_gt.shape) == 3:
+                frame_count = wTc_gt.shape[0]
+            else:
+                frame_count = 1
+            obj_world = None
+            obj_faces = None
+            LOGGER.warning(f"wTo not found in {npz_file}, skipping object mesh creation")
 
-        frame_count = wTo_mats.shape[0]
-        wTo_mats = wTo_mats.astype(np.float32)
-
-        # wTo is already aligned, so no wTwp transformation needed
-        wTo_aligned = torch.as_tensor(wTo_mats, dtype=torch.float32)
         wTc = torch.as_tensor(wTc_gt, dtype=torch.float32)
         camera_mats.extend([mat.astype(np.float32) for mat in wTc_gt])
-
-        # Create object mesh only
-        object_mesh = object_library[object_id_key]
-        obj_verts_exp = object_mesh.verts_padded().repeat(frame_count, 1, 1).to(
-            wTo_aligned.device
-        )
-        obj_faces = object_mesh.faces_padded()[0].cpu().numpy().astype(np.int32)
-        obj_world = mesh_utils.apply_transform(obj_verts_exp, wTo_aligned)
-
-        obj_world = obj_world.cpu().numpy().astype(np.float32)
         wTc = wTc.cpu().numpy().astype(np.float32)
 
-        scene_vertices.append(obj_world.reshape(-1, 3))
         scene_vertices.append(wTc[:, :3, 3])
 
         if osp.isdir(npz_dir):
@@ -332,6 +346,15 @@ def convert_npz_to_asset_list(
                 f"{t:04d}.jpg",
             )
 
+            meshes = []
+            if obj_world is not None:
+                meshes.append({
+                    "name": "object",
+                    "vertices": obj_world[t],
+                    "faces": obj_faces,
+                    "color": object_color,
+                })
+            
             asset_bundle = {
                 "frame": int(t),
                 "seq_id": seq_id,
@@ -343,14 +366,7 @@ def convert_npz_to_asset_list(
                     "width": width,
                     "height": height,
                 },
-                "meshes": [
-                    {
-                        "name": "object",
-                        "vertices": obj_world[t],
-                        "faces": obj_faces,
-                        "color": object_color,
-                    },
-                ],
+                "meshes": meshes,
             }
             assert osp.exists(image_path), image_path
             asset_bundle["image_path"] = image_path
@@ -449,18 +465,36 @@ def convert_pkl_to_asset_list(
         # if object_id_key not in object_library and object_id_key.zfill(6) in object_library:
         #     object_id_key = object_id_key.zfill(6)
 
-        wTo_raw = np.asarray(pred_file["wTo"], dtype=np.float32)
+        # Get wTo (optional - may not exist in some files)
+        wTo_raw = pred_file.get("wTo")
+        if wTo_raw is not None:
+            wTo_raw = np.asarray(wTo_raw, dtype=np.float32)
+            if wTo_raw.shape[-1] > 9:
+                LOGGER.debug(
+                    "wTo last dimension %d > 9, truncating to first 9 entries.", wTo_raw.shape[-1]
+                )
+                wTo_raw = wTo_raw[..., :9]
+            wTo_mats = _pose9_to_matrix(wTo_raw)
+            frame_count = wTo_mats.shape[0]
+        else:
+            # If wTo is missing, determine frame_count from wTc or hand params
+            wTc_temp = np.asarray(pred_file.get("wTc"), dtype=np.float32)
+            if wTc_temp.shape[-1] == 9:
+                wTc_temp = _pose9_to_matrix(wTc_temp)
+            if len(wTc_temp.shape) == 3:
+                frame_count = wTc_temp.shape[0]
+            else:
+                # Fallback to hand params
+                left_params_temp = pred_file.get("left_hand_params")
+                if left_params_temp is not None:
+                    frame_count = len(left_params_temp) if hasattr(left_params_temp, '__len__') else 1
+                else:
+                    frame_count = 1
+            wTo_mats = None
+            LOGGER.warning(f"wTo not found in {pkl_file}, skipping object mesh creation")
+        
         left_params = torch.as_tensor(pred_file["left_hand_params"], dtype=torch.float32)
         right_params = torch.as_tensor(pred_file["right_hand_params"], dtype=torch.float32)
-
-        if wTo_raw.shape[-1] > 9:
-            LOGGER.debug(
-                "wTo last dimension %d > 9, truncating to first 9 entries.", wTo_raw.shape[-1]
-            )
-            wTo_raw = wTo_raw[..., :9]
-
-        wTo_mats = _pose9_to_matrix(wTo_raw)
-        frame_count = wTo_mats.shape[0]
 
         contact = np.asarray(pred_file["contact"], dtype=np.float32)
         if contact.ndim != 2:
@@ -497,33 +531,39 @@ def convert_pkl_to_asset_list(
 
         left_verts = mesh_utils.apply_transform(left_verts, wTwp)
         right_verts = mesh_utils.apply_transform(right_verts, wTwp)
-        wTo_aligned = torch.matmul(
-            wTwp, torch.as_tensor(wTo_mats, dtype=torch.float32)
-        )
         wTc_aligned = torch.matmul(wTwp, torch.as_tensor(wTc, dtype=torch.float32))
 
         left_faces_np = left_faces[0].cpu().numpy().astype(np.int32)
         right_faces_np = right_faces[0].cpu().numpy().astype(np.int32)
 
-        object_mesh = object_library[object_id_key]
-        obj_verts_exp = object_mesh.verts_padded().repeat(frame_count, 1, 1).to(
-            wTo_aligned.device
-        )
-        obj_faces = object_mesh.faces_padded()[0].cpu().numpy().astype(np.int32)
-        obj_world = mesh_utils.apply_transform(obj_verts_exp, wTo_aligned)
+        # Create object mesh only if wTo_mats is available
+        if wTo_mats is not None:
+            wTo_aligned = torch.matmul(
+                wTwp, torch.as_tensor(wTo_mats, dtype=torch.float32)
+            )
+            object_mesh = object_library[object_id_key]
+            obj_verts_exp = object_mesh.verts_padded().repeat(frame_count, 1, 1).to(
+                wTo_aligned.device
+            )
+            obj_faces = object_mesh.faces_padded()[0].cpu().numpy().astype(np.int32)
+            obj_world = mesh_utils.apply_transform(obj_verts_exp, wTo_aligned)
+            obj_world = obj_world.cpu().numpy().astype(np.float32)
+        else:
+            obj_world = None
+            obj_faces = None
 
         left_verts = left_verts.cpu().numpy().astype(np.float32)
         right_verts = right_verts.cpu().numpy().astype(np.float32)
-        obj_world = obj_world.cpu().numpy().astype(np.float32)
         wTc = wTc_aligned.cpu().numpy().astype(np.float32)
 
         scene_vertices.extend(
             [
                 left_verts.reshape(-1, 3),
                 right_verts.reshape(-1, 3),
-                obj_world.reshape(-1, 3),
             ]
         )
+        if obj_world is not None:
+            scene_vertices.append(obj_world.reshape(-1, 3))
         scene_vertices.append(wTc[:, :3, 3])
 
         print(pkl_dir, osp.isdir(pkl_dir))
@@ -558,6 +598,28 @@ def convert_pkl_to_asset_list(
                 f"{t:04d}.jpg",
             )
 
+            meshes = [
+                {
+                    "name": "left_hand",
+                    "vertices": left_verts[t],
+                    "faces": left_faces_np,
+                    "color": left_color,
+                },
+                {
+                    "name": "right_hand",
+                    "vertices": right_verts[t],
+                    "faces": right_faces_np,
+                    "color": right_color,
+                },
+            ]
+            if obj_world is not None:
+                meshes.append({
+                    "name": "object",
+                    "vertices": obj_world[t],
+                    "faces": obj_faces,
+                    "color": object_color,
+                })
+            
             asset_bundle = {
                 "frame": int(t),
                 "seq_id": seq_id,
@@ -569,26 +631,7 @@ def convert_pkl_to_asset_list(
                     "width": width,
                     "height": height,
                 },
-                "meshes": [
-                    {
-                        "name": "left_hand",
-                        "vertices": left_verts[t],
-                        "faces": left_faces_np,
-                        "color": left_color,
-                    },
-                    {
-                        "name": "right_hand",
-                        "vertices": right_verts[t],
-                        "faces": right_faces_np,
-                        "color": right_color,
-                    },
-                    {
-                        "name": "object",
-                        "vertices": obj_world[t],
-                        "faces": obj_faces,
-                        "color": object_color,
-                    },
-                ],
+                "meshes": meshes,
             }
             assert osp.exists(image_path), image_path
             asset_bundle["image_path"] = image_path

@@ -4,7 +4,7 @@ two usage cases:
 import logging
 import shutil
 from pathlib import Path
-from typing import Sequence
+from typing import List, Sequence
 
 import imageio
 import numpy as np
@@ -193,6 +193,150 @@ def merge_videos_3way(
         LOGGER.info(f"Copied merged video to: {ways3_video_path}")
 
 
+def merge_videos_3way_teaser(
+    segment_id: int,
+    video_fps: int = 30,
+) -> str | None:
+    """Merge teaser videos into a 3-way layout.
+    
+    Layout:
+    - Top left: input video (H/2 x W/2)
+    - Bottom left: camera video (H/2 x W/2)
+    - Right: alloc video (H x W)
+    
+    Args:
+        segment_id: Segment ID (e.g., 3 for segment3)
+        video_fps: Video FPS (default: 30)
+    
+    Returns:
+        Error message string if error occurred, None if successful
+    """
+    _ensure_logger()
+    
+    try:
+        # Input video paths
+        video_dir = Path(f"/move/u/yufeiy2/egorecon/outputs/blender_results/teaser_segment/segment{segment_id}/video")
+        input_video_path = video_dir / "teaser_input.mp4"
+        camera_video_path = video_dir / "teaser_camera.mp4"
+        alloc_video_path = video_dir / "teaser_alloc.mp4"
+        
+        # Output path
+        merged_dir = Path("/move/u/yufeiy2/egorecon/outputs/blender_results/teaser_segment/merged")
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        output_video_path = merged_dir / f"merge_video{segment_id}.mp4"
+        
+        if output_video_path.exists():
+            LOGGER.info(f"Merged video already exists, skipping: {output_video_path}")
+            return None
+        
+        # Check if required files exist
+        if not input_video_path.exists():
+            error_msg = f"Input video not found: {input_video_path}"
+            LOGGER.warning(error_msg)
+            return error_msg
+        if not camera_video_path.exists():
+            error_msg = f"Camera video not found: {camera_video_path}"
+            LOGGER.warning(error_msg)
+            return error_msg
+        if not alloc_video_path.exists():
+            error_msg = f"Alloc video not found: {alloc_video_path}"
+            LOGGER.warning(error_msg)
+            return error_msg
+        
+        # Read all three videos
+        LOGGER.info(f"Reading videos: input={input_video_path}, camera={camera_video_path}, alloc={alloc_video_path}")
+        
+        try:
+            input_reader = imageio.get_reader(str(input_video_path))
+            camera_reader = imageio.get_reader(str(camera_video_path))
+            alloc_reader = imageio.get_reader(str(alloc_video_path))
+        except Exception as e:
+            error_msg = f"Error opening video files for segment {segment_id}: {str(e)}"
+            LOGGER.error(error_msg)
+            return error_msg
+        
+        # Get alloc video dimensions (this will be the full size)
+        alloc_meta = alloc_reader.get_meta_data()
+        alloc_height = alloc_meta['size'][1]
+        alloc_width = alloc_meta['size'][0]
+        
+        # Input and camera should be half size
+        small_height = alloc_height // 2
+        small_width = small_height
+        
+        # Total output dimensions: (H, W + W/2) = (H, 3W/2)
+        output_height = alloc_height
+        output_width = alloc_width + small_width
+        
+        LOGGER.info(f"Output dimensions: {output_width}x{output_height}")
+        LOGGER.info(f"Small videos (input/camera): {small_width}x{small_height}")
+        LOGGER.info(f"Alloc video: {alloc_width}x{alloc_height}")
+        
+        # Get frame counts
+        num_frames = min(
+            input_reader.count_frames(),
+            camera_reader.count_frames(),
+            alloc_reader.count_frames()
+        )
+        
+        LOGGER.info(f"Merging {num_frames} frames...")
+        
+        # Create output video writer
+        output_writer = imageio.get_writer(
+            str(output_video_path),
+            fps=video_fps,
+            codec="libx264",
+            quality=8
+        )
+        
+        try:
+            for frame_idx in tqdm(range(num_frames), desc="Merging frames"):
+                # Read frames
+                input_frame = input_reader.get_data(frame_idx)
+                camera_frame = camera_reader.get_data(frame_idx)
+                alloc_frame = alloc_reader.get_data(frame_idx)
+                
+                # Resize input and camera to small size
+                input_img = Image.fromarray(input_frame)
+                camera_img = Image.fromarray(camera_frame)
+                
+                input_small = input_img.resize((small_width, small_height), Image.Resampling.LANCZOS)
+                camera_small = camera_img.resize((small_width, small_height), Image.Resampling.LANCZOS)
+                
+                # Convert back to numpy
+                input_small_arr = np.array(input_small)
+                camera_small_arr = np.array(camera_small)
+                
+                # Create composite frame
+                composite = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+                
+                # Top left: input
+                composite[:small_height, :small_width] = input_small_arr[:, :, :3]
+                
+                # Bottom left: camera
+                composite[small_height:, :small_width] = camera_small_arr[:, :, :3]
+                
+                # Right: alloc (full size)
+                composite[:, small_width:] = alloc_frame[:, :, :3]
+                
+                # Write frame
+                output_writer.append_data(composite)
+        
+        finally:
+            input_reader.close()
+            camera_reader.close()
+            alloc_reader.close()
+            output_writer.close()
+        
+        LOGGER.info(f"Created merged video: {output_video_path}")
+        return None
+    
+    except Exception as e:
+        error_msg = f"Error processing segment {segment_id}: {str(e)}"
+        LOGGER.error(error_msg)
+        return error_msg
+
+
 def merge_videos_cmp_hoi_aligned(
     seq_obj: str,
     alloc_path: Path,
@@ -298,10 +442,13 @@ def merge_videos_cmp_hoi_aligned(
         top_width = gt_meta["size"][0]
         tile_size = min(top_height, top_width)
         
+        # Top row: input + method_list = 1 + len(method_list) videos
+        # Bottom row: gt + method_list = 1 + len(method_list) videos
+        num_columns = len(method_list) + 1  # +1 for input/gt
         output_height = tile_size * 2
-        output_width = tile_size * 4
+        output_width = tile_size * num_columns
         
-        LOGGER.info(f"Tile size: {tile_size}, output: {output_width}x{output_height}")
+        LOGGER.info(f"Tile size: {tile_size}, columns: {num_columns}, output: {output_width}x{output_height}")
         
         # Frame count limited by all videos
         num_frames = min(
@@ -377,6 +524,196 @@ def merge_videos_cmp_hoi_aligned(
     finally:
         for reader in readers:
             reader.close()
+
+
+def merge_videos_cmp_obj_aligned(
+    seq_obj: str,
+    alloc_path: Path,
+    method_list: Sequence[str],
+    image_folder: str = "images",
+    video_fps: int = 30,
+) -> None:
+    """Merge videos into a 2x4 aligned layout for object comparison (no hand).
+    
+    Layout:
+    Top row (square videos): input | fp_camera_no_hand | fp_simple_camera_no_hand | fp_full_camera_no_hand | ours_camera_no_hand
+    Bottom row (square videos cropped from alloc renders):
+        gt_alloc_no_hand | fp_alloc_no_hand | fp_simple_alloc_no_hand | fp_full_alloc_no_hand | ours_alloc_no_hand
+    
+    Args:
+        seq_obj: Sequence/object identifier.
+        alloc_path: Base directory containing method folders with alloc videos.
+        method_list: List of method names for camera videos (order matters).
+        image_folder: Folder containing camera frames/videos.
+        video_fps: Output video FPS.
+    """
+    _ensure_logger()
+    
+    # Paths for GT input / camera frames
+    gt_image_dir = SAVE_ROOT / "gt" / seq_obj / image_folder
+    gt_video_camera_dir = gt_image_dir / "video_camera_frames"
+    gt_input_path = gt_image_dir / f"{seq_obj}_gt_input.mp4"
+    
+    # Build camera video paths for methods (with _no_hand suffix)
+    camera_paths = [
+        SAVE_ROOT / method / seq_obj / image_folder / f"{seq_obj}_{method}_camera_no_hand.mp4"
+        for method in method_list
+    ]
+    
+    # Build alloc video paths (gt + each method) from <alloc_path>/<method>/<seq_obj>/<image_folder>/*.mp4 (with _no_hand suffix)
+    alloc_methods = ["gt", *method_list]
+    alloc_paths = [
+        alloc_path / method / seq_obj / image_folder / f"{seq_obj}_{method}_alloc_no_hand.mp4"
+        for method in alloc_methods
+    ]
+    
+    output_path = SAVE_ROOT / "ours" / "cmp_obj" / f"{seq_obj}_cmp_obj_aligned.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if output_path.exists():
+        LOGGER.info(f"Aligned comparison video already exists, skipping: {output_path}")
+        return
+    
+    # Ensure GT input video exists (encode from frames if needed)
+    if not gt_input_path.exists():
+        LOGGER.info(f"Creating GT input video from frames in: {gt_video_camera_dir}")
+        if not gt_video_camera_dir.exists():
+            LOGGER.error(f"GT video camera frames directory not found: {gt_video_camera_dir}")
+            return
+        input_frame_paths = sorted(gt_video_camera_dir.glob("*_input.png"))
+        if not input_frame_paths:
+            LOGGER.error(f"No input frames found matching '*_input.png' in {gt_video_camera_dir}")
+            return
+        _create_video_from_frames(
+            gt_video_camera_dir,
+            gt_input_path,
+            fps=video_fps,
+            pattern="*_input.png",
+        )
+        if not gt_input_path.exists():
+            LOGGER.error(f"Failed to create GT input video: {gt_input_path}")
+            return
+    
+    # Validate video availability
+    if not gt_input_path.exists():
+        LOGGER.warning(f"GT input video not found: {gt_input_path}")
+        return
+    
+    missing_camera = [
+        (method, path) for method, path in zip(method_list, camera_paths) if not path.exists()
+    ]
+    if missing_camera:
+        for method, path in missing_camera:
+            LOGGER.warning(f"Camera video not found for {method}: {path}")
+        return
+    
+    missing_alloc = [
+        (method, path) for method, path in zip(alloc_methods, alloc_paths) if not path.exists()
+    ]
+    if missing_alloc:
+        for method, path in missing_alloc:
+            LOGGER.warning(f"Alloc video not found for {method}: {path}")
+        return
+    
+    LOGGER.info(f"Merging aligned object comparison videos for {seq_obj}")
+    
+    # Prepare readers
+    gt_reader = imageio.get_reader(str(gt_input_path))
+    camera_readers = [imageio.get_reader(str(path)) for path in camera_paths]
+    alloc_readers = [imageio.get_reader(str(path)) for path in alloc_paths]
+    
+    readers = [gt_reader, *camera_readers, *alloc_readers]
+    
+    try:
+        # Determine square tile size from GT input (top row)
+        gt_meta = gt_reader.get_meta_data()
+        top_height = gt_meta["size"][1]
+        top_width = gt_meta["size"][0]
+        tile_size = min(top_height, top_width)
+        
+        # Top row: input + method_list = 1 + len(method_list) videos
+        # Bottom row: gt + method_list = 1 + len(method_list) videos
+        num_columns = len(method_list) + 1  # +1 for input/gt
+        output_height = tile_size * 2
+        output_width = tile_size * num_columns
+        
+        LOGGER.info(f"Tile size: {tile_size}, columns: {num_columns}, output: {output_width}x{output_height}")
+        
+        # Frame count limited by all videos
+        num_frames = min(
+            gt_reader.count_frames(),
+            min(r.count_frames() for r in camera_readers),
+            min(r.count_frames() for r in alloc_readers),
+        )
+        
+        LOGGER.info(f"Merging {num_frames} frames...")
+        
+        output_writer = imageio.get_writer(
+            str(output_path),
+            fps=video_fps,
+            codec="libx264",
+            quality=8,
+        )
+        
+        def crop_square(arr: np.ndarray) -> np.ndarray:
+            h, w = arr.shape[:2]
+            size = min(h, w)
+            top = (h - size) // 2
+            left = (w - size) // 2
+            return arr[top:top + size, left:left + size]
+        
+        try:
+            for frame_idx in tqdm(range(num_frames), desc="Merging aligned frames"):
+                # Top row frames
+                gt_frame = gt_reader.get_data(frame_idx)
+                camera_frames = [reader.get_data(frame_idx) for reader in camera_readers]
+                
+                top_frames = [gt_frame, *camera_frames]
+                top_squares = []
+                for frame in top_frames:
+                    square = crop_square(frame) if frame.shape[0] != frame.shape[1] else frame
+                    if square.shape[0] != tile_size:
+                        square = np.array(
+                            Image.fromarray(square).resize(
+                                (tile_size, tile_size), Image.Resampling.LANCZOS
+                            )
+                        )
+                    top_squares.append(square[:, :, :3])
+                
+                # Bottom row frames
+                alloc_frames = [reader.get_data(frame_idx) for reader in alloc_readers]
+                bottom_squares = []
+                for frame in alloc_frames:
+                    square = crop_square(frame)
+                    if square.shape[0] != tile_size:
+                        square = np.array(
+                            Image.fromarray(square).resize(
+                                (tile_size, tile_size), Image.Resampling.LANCZOS
+                            )
+                        )
+                    bottom_squares.append(square[:, :, :3])
+                
+                composite = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+                
+                # Place top row
+                for idx, square in enumerate(top_squares):
+                    x0 = idx * tile_size
+                    composite[:tile_size, x0:x0 + tile_size] = square
+                
+                # Place bottom row
+                for idx, square in enumerate(bottom_squares):
+                    x0 = idx * tile_size
+                    composite[tile_size:, x0:x0 + tile_size] = square
+                
+                output_writer.append_data(composite)
+        finally:
+            output_writer.close()
+        
+        LOGGER.info(f"Created aligned comparison video: {output_path}")
+    finally:
+        for reader in readers:
+            reader.close()
+
 
 def merge_videos_cmp_hoi(
     seq_obj: str,
@@ -571,20 +908,46 @@ def merge_videos_for_seq_obj_list(
         method: Method name
         image_folder: Image folder name (default: "images")
         video_fps: Video FPS (default: 30)
+        mode: Merge mode
     """
     _ensure_logger()
     
+    errors: List[str] = []
+    
     for seq_obj in tqdm(seq_obj_list, desc="Merging videos"):
-        if mode == "3way":
-            merge_videos_3way(seq_obj, method, image_folder, video_fps)
-        elif mode == "cmp_hoi":
-            alloc_path = SAVE_ROOT / f"cmp_gt+fp_simple+fp_full+ours/{seq_obj}/video_new/"
-            method_list = ["fp_simple", "fp_full", "ours"]
-            merge_videos_cmp_hoi(seq_obj, alloc_path, method_list, image_folder, video_fps)
-        elif mode == "cmp_hoi_aligned":
-            method_list = ["fp_simple", "fp_full", "ours"]
-            merge_videos_cmp_hoi_aligned(seq_obj, SAVE_ROOT, method_list, image_folder, video_fps)
-
+        try:
+            if mode == "3way":
+                merge_videos_3way(seq_obj, method, image_folder, video_fps)
+            elif mode == "3way_teaser":
+                # seq_obj is actually segment_id for teaser mode
+                segment_id = int(seq_obj) if seq_obj.isdigit() else int(seq_obj.replace("segment", ""))
+                error = merge_videos_3way_teaser(segment_id, video_fps)
+                if error:
+                    errors.append(error)
+            elif mode == "cmp_hoi":
+                alloc_path = SAVE_ROOT / f"cmp_gt+fp_simple+fp_full+ours/{seq_obj}/video_new/"
+                method_list = ["fp_simple", "fp_full", "ours"]
+                merge_videos_cmp_hoi(seq_obj, alloc_path, method_list, image_folder, video_fps)
+            elif mode == "cmp_hoi_aligned":
+                method_list = ["fp_simple", "fp_full", "ours"]
+                merge_videos_cmp_hoi_aligned(seq_obj, SAVE_ROOT, method_list, image_folder, video_fps)
+            elif mode == "cmp_obj_aligned":
+                method_list = ["fp", "fp_simple", "fp_full", "ours"]
+                merge_videos_cmp_obj_aligned(seq_obj, SAVE_ROOT, method_list, image_folder, video_fps)
+        except Exception as e:
+            error_msg = f"Error processing {seq_obj}: {str(e)}"
+            errors.append(error_msg)
+            LOGGER.error(error_msg)
+            continue
+    
+    # Print all errors at the end
+    if errors:
+        LOGGER.error("\n" + "="*80)
+        LOGGER.error(f"Summary: {len(errors)} error(s) occurred during processing:")
+        LOGGER.error("="*80)
+        for i, error in enumerate(errors, 1):
+            LOGGER.error(f"{i}. {error}")
+        LOGGER.error("="*80)
 
 
 
@@ -599,21 +962,35 @@ def merge_to_ours(
     """Main function to merge videos for one or more sequence/object pairs.
     
     Args:
-        seq_obj: Single sequence/object identifier, or None to use split
+        seq_obj: Single sequence/object identifier, or None to use split or discover segments
         method: Method name (default: "ours")
         image_folder: Image folder name (default: "images")
         video_fps: Video FPS (default: 30)
         split: Split name to use if seq_obj is None (default: "test50obj")
+        mode: Merge mode - "3way", "3way_teaser", "cmp_hoi", etc. (default: "3way")
     """
     _ensure_logger()
     
     if seq_obj is None:
-        import json
-        import os.path as osp
-        split_file = osp.join("data/HOT3D-CLIP", "sets", "split.json")
-        with open(split_file, "r", encoding="utf-8") as f:
-            split_dict = json.load(f)
-        seq_obj_list = split_dict[split]
+        if mode == "3way_teaser":
+            # Discover all segments
+            teaser_base = Path("/move/u/yufeiy2/egorecon/outputs/blender_results/teaser_segment")
+            segment_dirs = sorted(teaser_base.glob("segment*"))
+            seq_obj_list = []
+            for segment_dir in segment_dirs:
+                # Extract segment ID from directory name (e.g., "segment3" -> "3")
+                segment_name = segment_dir.name
+                if segment_name.startswith("segment"):
+                    segment_id = segment_name.replace("segment", "")
+                    seq_obj_list.append(segment_id)
+            LOGGER.info(f"Discovered {len(seq_obj_list)} segments: {seq_obj_list}")
+        else:
+            import json
+            import os.path as osp
+            split_file = osp.join("data/HOT3D-CLIP", "sets", "split.json")
+            with open(split_file, "r", encoding="utf-8") as f:
+                split_dict = json.load(f)
+            seq_obj_list = split_dict[split]
     else:
         seq_obj_list = [seq_obj]
     

@@ -127,6 +127,7 @@ def _run_blender(
     render_target_frame: bool = True,
     render_camera: bool = False,
     render_hand: bool = True,
+    render_obj: bool = True,
     render_obj_trail: bool = False,
     render_trail: bool = True,
     vis_contact: bool = False,
@@ -170,6 +171,7 @@ def _run_blender(
     cmd.append("--render-trail" if render_trail else "--no-render-trail")
     cmd.append("--vis-contact" if vis_contact else "--no-vis-contact")
     cmd.append("--render-hand" if render_hand else "--no-render-hand")
+    cmd.append("--render-obj" if render_obj else "--no-render-obj")
     cmd.append("--vis-obj-trail" if render_obj_trail else "--no-vis-obj-trail")
     if save_blend_path is not None:
         cmd.extend(["--save-blend", str(save_blend_path)])
@@ -211,12 +213,17 @@ def _gather_scene_vertices(bundle_dir: Path) -> Tuple[List[np.ndarray], List[Pat
     return scene_vertices, asset_paths
 
 
-def _rename_outputs(image_dir: Path, seq_obj: str, method: str, web_dir: Path, no_hand: bool = False) -> None:
+def _rename_outputs(image_dir: Path, seq_obj: str, method: str, web_dir: Path, no_hand: bool = False, no_obj: bool = False) -> None:
     web_dir.mkdir(parents=True, exist_ok=True)
     for path in list(image_dir.glob("*.png")):
         stem = path.stem
         suffix = path.suffix
-        suffix_str = "_no_hand" if no_hand else ""
+        suffix_parts = []
+        if no_hand:
+            suffix_parts.append("no_hand")
+        if no_obj:
+            suffix_parts.append("no_obj")
+        suffix_str = "_" + "_".join(suffix_parts) if suffix_parts else ""
         new_name = f"{seq_obj}_{stem}_{method}{suffix_str}{suffix}"
         target_path = web_dir / new_name
         if target_path.exists():
@@ -584,6 +591,7 @@ def render_all_methods(
     render_samples: int = 64,
     dynamic_floor: bool = False,
     no_hand: bool = False,
+    no_obj: bool = False,
     **kwargs,
 ) -> None:
     """Convert and render the specified methods for a sequence/object pair."""
@@ -610,6 +618,14 @@ def render_all_methods(
     else:
         base_render_hand = bool(kwargs.get("render_hand", True))
     LOGGER.info(f"render_all_methods: base_render_hand={base_render_hand}")
+    
+    # If --no_obj is set, override render_obj
+    LOGGER.info(f"render_all_methods: no_obj={no_obj}, kwargs.render_obj={kwargs.get('render_obj', 'not set')}")
+    if no_obj:
+        base_render_obj = False
+    else:
+        base_render_obj = bool(kwargs.get("render_obj", True))
+    LOGGER.info(f"render_all_methods: base_render_obj={base_render_obj}")
     if render_hand_per_method is None:
         method_hand_flags = [base_render_hand for _ in method_list]
     else:
@@ -752,6 +768,7 @@ def render_all_methods(
                     render_target_frame=False,  # No camera view
                     render_camera=False,  # No camera wireframes
                     render_hand=True,
+                    render_obj=base_render_obj,
                     render_trail=False,  # No hand/camera trails
                     vis_contact=kwargs.get("vis_contact", False),
                     render_video=True,
@@ -763,8 +780,13 @@ def render_all_methods(
                 )
             
             # Create video
-            suffix_str = "_no_hand" if no_hand else ""
-            LOGGER.info(f"Creating joint allocentric video with no_hand={no_hand}, suffix='{suffix_str}'")
+            suffix_parts = []
+            if no_hand:
+                suffix_parts.append("no_hand")
+            if no_obj:
+                suffix_parts.append("no_obj")
+            suffix_str = "_" + "_".join(suffix_parts) if suffix_parts else ""
+            LOGGER.info(f"Creating joint allocentric video with no_hand={no_hand}, no_obj={no_obj}, suffix='{suffix_str}'")
             alloc_video_path = joint_output_dir / f"{seq_obj}_joint_alloc{suffix_str}.mp4"
             LOGGER.info(f"Video path: {alloc_video_path}")
             _create_video_from_frames(video_alloc_dir, alloc_video_path, fps=video_fps, pattern="*_allocentric_overlay.png")
@@ -812,6 +834,7 @@ def render_all_methods(
                         render_target_frame=True,
                         render_camera=kwargs.get("render_camera", False),
                         render_hand=render_hand_flag,
+                        render_obj=base_render_obj,
                         render_obj_trail=vis_obj_trail,
                         vis_contact=kwargs.get("vis_contact", False),
                         render_video=True,
@@ -836,6 +859,7 @@ def render_all_methods(
                         render_target_frame=False,
                         render_camera=kwargs.get("render_camera", False),
                         render_hand=render_hand_flag,
+                        render_obj=base_render_obj,
                         render_obj_trail=vis_obj_trail,
                         vis_contact=kwargs.get("vis_contact", False),
                         render_video=True,
@@ -854,8 +878,13 @@ def render_all_methods(
                         _overlay_camera_on_input(camera_frame_path, input_frame_path, overlay_frame_path)
                 
                 # Create videos
-                suffix_str = "_no_hand" if no_hand else ""
-                LOGGER.info(f"Creating videos for {method} with no_hand={no_hand}, suffix='{suffix_str}'")
+                suffix_parts = []
+                if no_hand:
+                    suffix_parts.append("no_hand")
+                if no_obj:
+                    suffix_parts.append("no_obj")
+                suffix_str = "_" + "_".join(suffix_parts) if suffix_parts else ""
+                LOGGER.info(f"Creating videos for {method} with no_hand={no_hand}, no_obj={no_obj}, suffix='{suffix_str}'")
                 camera_video_path = image_dir / f"{seq_obj}_{method}_camera{suffix_str}.mp4"
                 alloc_video_path = image_dir / f"{seq_obj}_{method}_alloc{suffix_str}.mp4"
                 overlay_video_path = image_dir / f"{seq_obj}_{method}_overlay{suffix_str}.mp4"
@@ -888,10 +917,11 @@ def render_all_methods(
                     render_target_frame=False,
                     render_camera=kwargs.get("render_camera", False),
                     render_hand=render_hand_flag,
+                    render_obj=base_render_obj,
                     render_obj_trail=vis_obj_trail,
                     vis_contact=kwargs.get("vis_contact", False),
                 )
-                _rename_outputs(image_dir, seq_obj, method, web_dir, no_hand=no_hand)
+                _rename_outputs(image_dir, seq_obj, method, web_dir, no_hand=no_hand, no_obj=no_obj)
 
                 for tf in frame_list:
                     _run_blender(
@@ -1026,6 +1056,7 @@ def render_samples_from_list(
                     render_target_frame=False,  # No camera view
                     render_camera=False,  # No camera wireframes
                     render_hand=True,
+                    render_obj=True,  # Keep objects for sample rendering
                     render_trail=False,  # No trails
                     vis_contact=True,  # Use vis_contact=True as specified
                     render_video=True,
@@ -1068,6 +1099,7 @@ def main(
     render_samples: int = 64,
     dynamic_floor: bool = False,
     no_hand: bool = False,
+    no_obj: bool = False,
     skip=False,
     **kwargs,
 ) -> None:
@@ -1110,6 +1142,7 @@ def main(
                 render_samples=render_samples,
                 dynamic_floor=dynamic_floor,
                 no_hand=no_hand,
+                no_obj=no_obj,
                 **kwargs,
             )
             os.makedirs(done_file)
