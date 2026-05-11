@@ -439,7 +439,10 @@ def convert_pkl_to_asset_list(
         for k, v in pred_file.items():
             if hasattr(v, 'shape'):
                 if k != 'wTc':
-                    pred_file[k] = v[0]
+                    if isinstance(v, torch.Tensor):
+                        pred_file[k] = torch.squeeze(v)
+                    else:
+                        pred_file[k] = np.squeeze(v)
 
 
         index = pred_file.get("index", osp.splitext(osp.basename(pkl_file))[0])
@@ -462,8 +465,10 @@ def convert_pkl_to_asset_list(
         intr = meta.get("intrinsic")
 
         object_id_key = object_id
-        # if object_id_key not in object_library and object_id_key.zfill(6) in object_library:
-        #     object_id_key = object_id_key.zfill(6)
+        if object_id_key not in object_library:
+            stripped = object_id_key.split("_")[0]
+            if stripped in object_library:
+                object_id_key = stripped
 
         # Get wTo (optional - may not exist in some files)
         wTo_raw = pred_file.get("wTo")

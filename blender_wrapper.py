@@ -53,9 +53,12 @@ METHOD_TO_SOURCE = {
     "ours-gen": "outputs/org/ours/sample/{seq_obj}.pkl",
     "gt": "outputs/org/gt/{seq_obj}.pkl",
     "ours": "outputs/org/ours/post/{seq_obj}.pkl",
+    "collision": "outputs/org/ours/collision/{seq_obj}.pkl",
     "fp_simple": "outputs/org/ab_simple/post/{seq_obj}.pkl",
     "fp_full": "outputs/org/ab_full/post/{seq_obj}.pkl",
     "fp": "outputs/org/fp/{seq_obj}.npz",
+    "app_swap": "outputs/ready/ours/app/hand_guide_sigmoid/post/{seq_obj}_swap.pkl",
+    "app_orig": "outputs/ready/ours/app/hand_guide_sigmoid/post/{seq_obj}_orig.pkl",
 }
 
 METHOD_TO_COLOR = {
@@ -65,6 +68,8 @@ METHOD_TO_COLOR = {
     "fp_simple": "purple",
     "fp_full": "pink",
     "ours": "blue1",
+    "app_swap": "blue1",
+    "app_orig": "blue1",
 }
 for i in range(5):
     METHOD_TO_SOURCE["ours-gen-%d" % i] = "outputs/org/ours-gen/sample_%d/{seq_obj}.pkl" % i
@@ -904,41 +909,67 @@ def render_all_methods(
             for method, bundle_dir, image_dir, object_color, hand_color_entry, render_hand_flag in method_info:
                 image_dir.mkdir(parents=True, exist_ok=True)
 
-                # overlay_frame = frame_list[0]
-                _run_blender(
-                    blender_exec,
-                    bundle_dir,
-                    image_dir,
-                    object_color=object_color,
-                    hand_colors=hand_color_entry,
-                    target_frame=0,
-                    allocentric_step=allocentric_step,
-                    render_allocentric=True,
-                    render_target_frame=False,
-                    render_camera=kwargs.get("render_camera", False),
-                    render_hand=render_hand_flag,
-                    render_obj=base_render_obj,
-                    render_obj_trail=vis_obj_trail,
-                    vis_contact=kwargs.get("vis_contact", False),
-                )
-                _rename_outputs(image_dir, seq_obj, method, web_dir, no_hand=no_hand, no_obj=no_obj)
-
-                for tf in frame_list:
+                # Check if we should render target frames in allocentric view
+                render_target_alloc = kwargs.get("render_target_frames_alloc", False)
+                
+                # Only render frame 0 if not rendering target frames in allocentric view
+                if not render_target_alloc or not frame_list:
                     _run_blender(
                         blender_exec,
                         bundle_dir,
                         image_dir,
                         object_color=object_color,
                         hand_colors=hand_color_entry,
-                        target_frame=tf,
+                        target_frame=0,
                         allocentric_step=allocentric_step,
-                        render_allocentric=False,
-                        render_target_frame=True,
+                        render_allocentric=True,
+                        render_target_frame=False,
                         render_camera=kwargs.get("render_camera", False),
                         render_hand=render_hand_flag,
+                        render_obj=base_render_obj,
                         render_obj_trail=vis_obj_trail,
                         vis_contact=kwargs.get("vis_contact", False),
                     )
+                    _rename_outputs(image_dir, seq_obj, method, web_dir, no_hand=no_hand, no_obj=no_obj)
+
+                for tf in frame_list:
+                    if render_target_alloc:
+                        # Render in allocentric view
+                        _run_blender(
+                            blender_exec,
+                            bundle_dir,
+                            image_dir,
+                            object_color=object_color,
+                            hand_colors=hand_color_entry,
+                            target_frame=tf,
+                            allocentric_step=1,
+                            allocentric_frames=[tf],
+                            render_allocentric=True,
+                            render_target_frame=False,
+                            render_camera=kwargs.get("render_camera", False),
+                            render_hand=render_hand_flag,
+                            render_obj=base_render_obj,
+                            render_obj_trail=vis_obj_trail,
+                            render_trail=False,  # Disable hand trails in allocentric view
+                            vis_contact=kwargs.get("vis_contact", False),
+                        )
+                    else:
+                        # Render in camera view (original behavior)
+                        _run_blender(
+                            blender_exec,
+                            bundle_dir,
+                            image_dir,
+                            object_color=object_color,
+                            hand_colors=hand_color_entry,
+                            target_frame=tf,
+                            allocentric_step=allocentric_step,
+                            render_allocentric=False,
+                            render_target_frame=True,
+                            render_camera=kwargs.get("render_camera", False),
+                            render_hand=render_hand_flag,
+                            render_obj_trail=vis_obj_trail,
+                            vis_contact=kwargs.get("vis_contact", False),
+                        )
                     _rename_outputs(image_dir, seq_obj, method, web_dir, no_hand=no_hand)
 
 
